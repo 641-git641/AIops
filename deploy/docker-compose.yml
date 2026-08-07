@@ -1,0 +1,42 @@
+# AIOps 中间件编排：PostgreSQL（唯一存储，app 本地 run 连接）。
+# 规范约定：mysql/redis 等中间件一律用 docker 启动；应用本体开发期 `go run`。
+# 生产部署可参照 app 服务注释启用容器化。
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: aiops-postgres
+    environment:
+      POSTGRES_USER: aiops
+      POSTGRES_PASSWORD: aiops
+      POSTGRES_DB: aiops
+      TZ: Asia/Shanghai
+    ports:
+      - "5432:5432"
+    volumes:
+      - aiops_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aiops -d aiops"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  # --- 生产/演示用 app 容器（开发期注释掉，用 go run 本地跑）---
+  # app:
+  #   build:
+  #     context: ..
+  #     dockerfile: deploy/app.Dockerfile
+  #   container_name: aiops-app
+  #   environment:
+  #     AIOPS_ADDR: ":8080"
+  #     AIOPS_DBDSN: "host=postgres user=aiops password=aiops dbname=aiops port=5432 sslmode=disable TimeZone=Asia/Shanghai"
+  #     AIOPS_AUTHTYPE: "noauth"
+  #   ports:
+  #     - "8080:8080"
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #   restart: unless-stopped
+
+volumes:
+  aiops_pgdata:

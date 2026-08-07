@@ -1,0 +1,31 @@
+# Reference repos (independent clones, not part of this project)
+/keep/
+/multi-agent-aiops/
+
+# Go build artifacts
+/aiops
+/aiops.exe
+/bin/
+*.test
+
+# Local runtime state
+/state/
+/data/
+*.db
+*.db-shm
+*.db-wal
+
+# Node / web
+web/node_modules/
+web/dist/
+*.tsbuildinfo
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Env / secrets
+.env
+.env.local
