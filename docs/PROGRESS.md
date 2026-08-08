@@ -1,7 +1,7 @@
 # AIOps 告警平台 — 项目进度交接文档
 
 > 用途：跨会话/换窗口继续开发的现状快照。任何新窗口先读本文件 + README.md。
-> 最后更新：2026-08-08（Phase 3b 写入优化已提交 `61e7b18` 并重启 :8080 生效；Phase 3c 规则引擎规则缓存完成，P50 -7%/P99 -8%）
+> 最后更新：2026-08-08（Phase 3c 规则缓存 `f7884fb`；Phase 3d dedup 单读完成，P50 -30%/P99 -23%）
 
 ---
 
@@ -135,7 +135,27 @@ Alert → process_event ──┬── 确定性热路径（去重 → 入库 �
 - **单测**（rule_engine_test.go，5 个）：TTL 内命中不重查 / TTL 过期重查 / Invalidate 强制重查且不影响他租户 / **loader 失败不污染缓存**（错误不写入缓存，恢复后正常）/ 并发访问安全（Windows 下 `-race` 工具链不可用，常规 -run 通过）。
 - **压测**（2000rps/300 并发/30s/variety 200，同 Phase 3b 基线）：**P50 51→47.4ms（-7%）、P99 88→80.7ms（-8%）**，吞吐 1795/s 持平（瓶颈仍在逐事件串行），失败率 0.026%。收益符合预期：规则读占 4 次往返的 1 次。
 - **e2e**：API 创建规则（critical + service=rcsmoke）→ 同条件告警 → 命中创建 `source=rule` incident（验证缓存命中路径 + Invalidate 后立即生效）；压测数据（alerts 4.2 万 + 8 个 loadgen AI 聚类 incident + 冒烟痕迹）按名清理，DB 恢复 129 alerts / 123 last_alerts / 2 rules / 56 incidents / 孤立 0。
-- **其余 lever**（尚未做）：dedup 2 读合并、`SaveAlerts` 批量写（需批内 overlay）、生产 HTTP 超时调优。
+- **其余 lever**（尚未做）：`SaveAlerts` 批量写（需批内 overlay）、生产 HTTP 超时调优。
+
+### Phase 3d — dedup 单读（2 读合并）✅（当前最新）
+- **动机**：规则缓存（3c）后每事件管线剩余 3 次 DB 往返（dedup **2 读** + 写 1 次）——dedup 原为 `GetLastAlert`（读 last_alerts 唯一索引）+ `Get(la.AlertID)`（回读 alerts 分区表拿 hash/status）。
+- **实现**：`alert_hash` 冗余进 `last_alerts`（与已有 `status` 并列，Phase 3b 设计上它本就是去重热路径唯一读表）。`dedup.Classify` 合并为**只查 (tenant, fingerprint) 唯一索引 1 次**，不再碰 alerts 分区表。所有写入路径同步维护冗余列：
+  - `SaveAlert` CTE（save_sql.go）：RETURNING 加 `alert_hash` → last_alerts INSERT/SELECT/ON CONFLICT 全链路携带。
+  - `UpsertLastAlert`（repository.go）：Create + `DoUpdates` AssignmentColumns 加 `alert_hash`。
+  - 迁移：AutoMigrate 加列后 `backfillLastAlertHash` 幂等回填存量行（从当前活跃告警 alerts 行取值；`alert_id` 已指向已删告警的残留行不回填，下次事件自然走 update 并回填，降级安全）。
+- **行为改进（review 确认）**：以 last_alerts 为当前状态真源——alerts 历史行被保留策略删掉后，旧代码 `Get` 查不到会误判 update 反复刷表；新代码基于状态缓存直接判 duplicate，语义更正确。
+- **重构**：`Deduper.repo` 从具体 `*alert.Repository` 改为最小接口 `LastAlertReader`（`GetLastAlert`），便于单测注入（与 rule_engine 可注入 loader 风格一致）；分类逻辑抽纯函数 `classifyLastAlert`。
+- **单测**（dedup_test.go，7 个）：classifyLastAlert 全分支（firing 同/diff hash、窗口内 suppressed、窗口失效上浮、resolved 复发）+ Classify 单读断言（恰好 1 次 GetLastAlert）+ new + 错误传播。
+- **压测**（2000rps/300 并发/30s/variety 200，同 3c 基线）：
+
+  | 版本 | P50 | P99 | 吞吐 | 失败率 |
+  |---|---|---|---|---|
+  | Phase 3b（无缓存） | 51ms | 88ms | 1790/s | 0.14% |
+  | Phase 3c（规则缓存） | 47.4ms | 80.7ms | 1795/s | 0.026% |
+  | **Phase 3d（dedup 单读）** | **33.1ms** | **61.9ms** | **1796/s** | **0.035%** |
+
+  **P50 -30%、P99 -23%**，吞吐持平（瓶颈已是写 1 次 + 业务逻辑）。收益比规则缓存更大——dedup 是每事件必走的 2 读。
+- **e2e**：三态验证——new（全新 fingerprint 入 1 行 alerts + 1 行 last_alerts）/ update（startsAt 变→hash 变→alerts 增行 + last_alerts 更新指向最新）/ duplicate（同 payload→alerts 不增）；`hash_matches_alerts=t` 证明 last_alerts.alert_hash == 当前活跃告警 hash；启动日志 `backfilled last_alerts.alert_hash rows=123`。压测/冒烟数据已清理，DB 恢复 129 alerts / 123 last_alerts / 56 incidents / 孤立 0。
 
 ---
 
@@ -271,7 +291,7 @@ dry-run（`AIOPS_AGENTDRYRUN=true` 默认）→ 爆炸半径 >`AIOPS_AGENTBLASTR
 | 组件 | 状态 | 备注 |
 |---|---|---|
 | PostgreSQL | docker 容器（compose） | `deploy/docker-compose.yml`，DSN `host=127.0.0.1 user=aiops password=aiops dbname=aiops port=5432` |
-| 后端 | :8080 运行中（PID 11380） | 启动命令含 `AIOPS_NOTIFIERCHANNELS=http AIOPS_NOTIFIERHTTP=http://localhost:9999/webhook AIOPS_NOTIFIERBASEURL=http://localhost:5173 ./bin/aiops.exe` |
+| 后端 | :8080 运行中（PID 13356，Phase 3d binary） | 启动命令含 `AIOPS_NOTIFIERCHANNELS=http AIOPS_NOTIFIERHTTP=http://localhost:9999/webhook AIOPS_NOTIFIERBASEURL=http://localhost:5173 ./bin/aiops.exe` |
 | mock webhook | :9999 运行中（PID 28620） | `node deploy/mock_webhook.mjs 9999`，收到的通知打印到 stdout |
 | 前端 | Vite dev :5173 | `cd web && npm run dev` |
 
@@ -409,8 +429,8 @@ cd web && npm run build                                    # tsc + vite build �
 |---|---|---|
 | ~~**LLM 深化**~~（✅ 已交付，Phase 2g） | 聚类摘要也接 LLM（非确定性模板）；LLM 建议动作回填 Heal；流式/超时可控 | ai + agent + web |
 | ~~**规模化**~~（✅ 已交付，Phase 3） | Postgres 加固、拓扑影响面（SQL 递归 CTE）、万级压测（10 倍余量达标）；Neo4j 后置仅替换 Impact 查询 | 全局 |
-| ~~**规模化延伸**~~（✅ 已交付，Phase 3b/3c） | alerts 月分区 + 保留 DROP、CTE 单语句写入、规则引擎规则缓存；批量写（D2）扫描论证后降级 | 全局 |
-| **规模化下一步**（候选） | 生产 HTTP 超时（WriteTimeout/IdleTimeout）按规格调优、dedup 2 读合并、`SaveAlerts` 批量写（需批内 overlay）、loadgen 接入 CI 回归基准 | 全局 |
+| ~~**规模化延伸**~~（✅ 已交付，Phase 3b/3c/3d） | alerts 月分区 + 保留 DROP、CTE 单语句写入、规则引擎规则缓存、dedup 2 读合并（last_alerts 冗余 alert_hash）；批量写（D2）扫描论证后降级 | 全局 |
+| **规模化下一步**（候选） | 生产 HTTP 超时（WriteTimeout/IdleTimeout）按规格调优、`SaveAlerts` 批量写（需批内 overlay）、loadgen 接入 CI 回归基准 | 全局 |
 
 基准报告见 **docs/PERF.md**（根因链/修复清单/服务端观测/建议）。
 

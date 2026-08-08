@@ -146,8 +146,29 @@ func migrate(db *gorm.DB, alertPartitions bool) error {
 	if err := db.AutoMigrate(models...); err != nil {
 		return err
 	}
+	if err := backfillLastAlertHash(db); err != nil {
+		return err
+	}
 	if alertPartitions {
 		return ensureAlertPartitions(db)
+	}
+	return nil
+}
+
+// backfillLastAlertHash 幂等回填 last_alerts.alert_hash（dedup 单读冗余列）。
+// 存量行在 AutoMigrate 加列后为 NULL：从当前活跃告警 alerts 行取值，
+// 使迁移后 dedup 立即走单读路径（避免存量 fingerprint 首个同内容事件误判 update）。
+func backfillLastAlertHash(db *gorm.DB) error {
+	res := db.Exec(
+		`UPDATE last_alerts la
+		 SET alert_hash = a.alert_hash
+		 FROM alerts a
+		 WHERE la.alert_id = a.id AND (la.alert_hash IS NULL OR la.alert_hash = '')`)
+	if res.Error != nil {
+		return fmt.Errorf("store: backfill last_alerts.alert_hash: %w", res.Error)
+	}
+	if res.RowsAffected > 0 {
+		slog.Info("store: backfilled last_alerts.alert_hash", "rows", res.RowsAffected)
 	}
 	return nil
 }

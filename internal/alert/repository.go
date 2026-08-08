@@ -48,13 +48,14 @@ func (r *Repository) upsertLastAlert(tx *gorm.DB, a *Alert) error {
 		TenantID:    a.TenantID,
 		Fingerprint: a.Fingerprint,
 		AlertID:     a.ID,
+		AlertHash:   a.AlertHash,
 		Status:      a.Status,
 		LastSeenAt:  a.LastSeenAt,
 	}
-	// 按 (tenant_id, fingerprint) 唯一索引 upsert
+	// 按 (tenant_id, fingerprint) 唯一索引 upsert（alert_hash 冗余列随写，dedup 单读依赖）
 	return tx.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "tenant_id"}, {Name: "fingerprint"}},
-		DoUpdates: clause.AssignmentColumns([]string{"alert_id", "status", "last_seen_at", "updated_at"}),
+		DoUpdates: clause.AssignmentColumns([]string{"alert_id", "alert_hash", "status", "last_seen_at", "updated_at"}),
 	}).Create(&la).Error
 }
 

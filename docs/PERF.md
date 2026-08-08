@@ -114,8 +114,22 @@ bucket le=0.05   45079   le=0.1  70702   le=0.25  99644   le=0.5  110681
 
   P50 -7%、P99 -8%，吞吐持平——剩余瓶颈是逐事件串行（dedup 2 读 + 写 1 次 + 业务逻辑），单次规则读已消除。规则表读在缓存命中时 TTL 内 0 次/事件。
 
+### D6：dedup 单读（2 读合并，Phase 3d）
+
+- 原 dedup 每事件 2 读：`GetLastAlert`（last_alerts 唯一索引）+ `Get(la.AlertID)`（回读 alerts 分区表）。`alert_hash` 冗余进 `last_alerts`（与 `status` 并列），写入路径（SaveAlert CTE / UpsertLastAlert）同步维护，迁移启动时 `backfillLastAlertHash` 幂等回填存量行 → `Classify` 只查 last_alerts 唯一索引 **1 次**，完全不再碰 alerts 分区表。
+- 实测（2000rps/300 并发/30s/variety 200，同 3b/3c 基线）：
+
+  | 版本 | P50 | P99 | 吞吐 | 失败率 |
+  |---|---|---|---|---|
+  | Phase 3b（无缓存） | 51ms | 88ms | 1790/s | 0.14% |
+  | Phase 3c（规则缓存） | 47.4ms | 80.7ms | 1795/s | 0.026% |
+  | **Phase 3d（dedup 单读）** | **33.1ms** | **61.9ms** | **1796/s** | **0.035%** |
+
+  **P50 -30%、P99 -23%**，吞吐持平。收益比规则缓存更大——dedup 是每事件必走的 2 读，而规则读只在命中规则时才有。至此逐事件 DB 往返从 Phase 3b 的 **4 次 → 2 次**（dedup 1 读 + 写 1 次，规则读已缓存）。
+- 正确性：last_alerts 为当前状态真源（retention 不清除），alerts 历史行被保留策略删除后仍能正确判 duplicate（旧逻辑会误判 update 反复刷表）。
+
 ## 建议（后续规模化）
 
 1. **Linux 部署**：回环连接问题仅 Windows 开发态出现；生产建议关闭 debug 模式 + 设置 `WriteTimeout`/`IdleTimeout`，连接池按实例规格调整
-2. **真实告警洪峰**（如 100+ 万/min）：瓶颈在逐事件管线串行（~50ms/事件 ≈ 3 次 DB 往返 + 业务逻辑，规则读已缓存）。方向：dedup 2 读合并、`SaveAlerts` 批量写（需批内去重 overlay，见上）、规则缓存 TTL 下调（`NewRuleEngine` 构造参数）
+2. **真实告警洪峰**（如 100+ 万/min）：瓶颈在逐事件管线串行（~35ms/事件 ≈ 2 次 DB 往返 + 业务逻辑，dedup 与规则读均已缓存/单读）。方向：`SaveAlerts` 批量写（需批内去重 overlay，见上）、规则缓存 TTL 下调（`NewRuleEngine` 构造参数）、dedup 读并入写入语句（write-return-last-alert，进一步 2 往返 → 1 往返，但改动大需评估）
 3. **压测脚本化**：loadgen 已支持 `-rate/-duration/-concurrency/-variety/-batch`，可接入 CI 作为回归基准（失败率 >1% 即非零退出）

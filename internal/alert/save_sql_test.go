@@ -77,6 +77,8 @@ func TestBuildSaveSQLAnchors(t *testing.T) {
 		"?::jsonb",                             // JSON 显式 cast
 		"ON CONFLICT (tenant_id, fingerprint)", // last_alerts 冲突仲裁
 		"RETURNING id",                         // CTE 数据修改子句
+		"RETURNING id, tenant_id, fingerprint, alert_hash, status, last_seen_at", // CTE 返回冗余列（dedup 单读依赖）
+		"alert_hash = EXCLUDED.alert_hash",                                       // 冲突更新同步 hash
 	} {
 		if !strings.Contains(sql, anchor) {
 			t.Errorf("SQL missing anchor %q\n---\n%s", anchor, sql)

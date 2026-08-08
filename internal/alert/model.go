@@ -74,11 +74,14 @@ type Alert struct {
 func (Alert) TableName() string { return "alerts" }
 
 // LastAlert 告警当前状态缓存（去重热路径），(tenant_id, fingerprint) 唯一。
+// alert_hash 冗余存储：与 status 一起保证 dedup 只读本表唯一索引 1 次即完成
+// 分类（不再回读 alerts 分区表），写入路径（SaveAlert CTE / UpsertLastAlert）同步维护。
 type LastAlert struct {
 	ID          string    `gorm:"primaryKey;size:36" json:"id"`
 	TenantID    string    `gorm:"size:64;uniqueIndex:uk_lastalert_tenant_fp,priority:1" json:"tenantId"`
 	Fingerprint string    `gorm:"size:64;uniqueIndex:uk_lastalert_tenant_fp,priority:2" json:"fingerprint"`
-	AlertID     string    `gorm:"size:36" json:"alertId"` // 当前活跃告警引用
+	AlertID     string    `gorm:"size:36" json:"alertId"`   // 当前活跃告警引用
+	AlertHash   string    `gorm:"size:64" json:"alertHash"` // 物理去重键（内容哈希）冗余
 	Status      string    `gorm:"size:16" json:"status"`
 	LastSeenAt  time.Time `json:"lastSeenAt"`
 	CreatedAt   time.Time `json:"createdAt"`

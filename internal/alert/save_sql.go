@@ -21,13 +21,14 @@ func buildSaveSQL(a *Alert) (string, []any) {
                         event, name, severity, status, labels,
                         started_at, last_seen_at, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?::jsonb, ?, ?, ?, ?::jsonb, ?, ?, ?, ?)
-    RETURNING id, tenant_id, fingerprint, status, last_seen_at
+    RETURNING id, tenant_id, fingerprint, alert_hash, status, last_seen_at
 )
-INSERT INTO last_alerts (id, tenant_id, fingerprint, alert_id, status, last_seen_at, created_at, updated_at)
-SELECT ?, tenant_id, fingerprint, id, status, last_seen_at, ?, ?
+INSERT INTO last_alerts (id, tenant_id, fingerprint, alert_id, alert_hash, status, last_seen_at, created_at, updated_at)
+SELECT ?, tenant_id, fingerprint, id, alert_hash, status, last_seen_at, ?, ?
 FROM ins
 ON CONFLICT (tenant_id, fingerprint) DO UPDATE SET
     alert_id = EXCLUDED.alert_id,
+    alert_hash = EXCLUDED.alert_hash,
     status = EXCLUDED.status,
     last_seen_at = EXCLUDED.last_seen_at,
     updated_at = EXCLUDED.updated_at`
