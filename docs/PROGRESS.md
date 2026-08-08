@@ -1,7 +1,7 @@
 # AIOps 告警平台 — 项目进度交接文档
 
 > 用途：跨会话/换窗口继续开发的现状快照。任何新窗口先读本文件 + README.md。
-> 最后更新：2026-08-08（Phase 3c 规则缓存 `f7884fb`；Phase 3d dedup 单读完成，P50 -30%/P99 -23%；Phase 3e 生产 HTTP 超时调优完成）
+> 最后更新：2026-08-08（Phase 3d dedup 单读完成 P50 -30%/P99 -23%；Phase 3e 生产 HTTP 超时调优完成；Phase 3f loadgen 接入 CI 回归基准完成）
 
 ---
 
@@ -163,6 +163,18 @@ Alert → process_event ──┬── 确定性热路径（去重 → 入库 �
 - **关键坑（必须记住）**：**coder/websocket hijack 后不会清除 net/http 落在底层连接上的读写 deadline（gorilla 有清、coder 没有）**。全局 `ReadTimeout` 直接 `SetReadDeadline` 残留、`WriteTimeout` 在 Go 1.26 是 readRequest 返回时 `defer SetWriteDeadline` 残留（不再是 timer）——WS 长连接会在超时秒数后读写被强制断开。修复：`hub.ServeWS` 在 `websocket.Accept` **前**用 `http.NewResponseController(w)` 清 `SetReadDeadline/SetWriteDeadline(time.Time{})`（沿 gin `ResponseWriter.Unwrap()` 到达底层 conn，Go 1.26 的 `response.SetReadDeadline` 直接转发无遮挡）。
 - **验证**：WS 探针连接在 `ReadTimeout=3s/WriteTimeout=4s` 下存活 10s+ 且实时收到 `alert.new/update/duplicate` 广播（deadline 清除生效）；REST 正常；`go build/vet/test` 全绿。
 - **性能**：纯配置层改动，无管线回归（同环境基线 d5dbdb7 对比 162ms vs 改动后 86ms，均受 PG 写入 LWLock/IO 瓶颈影响，见 PERF.md 当前环境说明）。
+
+### Phase 3f — loadgen 接入 CI 回归基准 ✅（当前最新）
+- **动机**（docs/PERF.md 建议 #3 落地项）：loadgen 已支持失败率 >1% 非零退出，但缺**机器可读留痕**与**基线对比**——本地无 remote，落为 make 目标当回归看门狗（一次压测 + 阈值判定，可接任何后续 CI）。
+- **loadgen 增强**（`cmd/loadgen`）新增 4 个 flag：
+  - `-summary <path>`：压测汇总写成 JSON（`run` profile：rate/duration/concurrency/variety/batch/severity；指标：elapsed/sent/ok/failed/失败率/吞吐/P50-P95-P99/max/dials/timestamp）。
+  - `-compare <baseline.json>`：载入基线汇总做回归对比——吞吐 < 基线×`-tol-throughput`（默认 0.8）或 P50/P99 > 基线×`-tol-latency`（默认 1.5）即回归，非零退出。**profile 与基线不一致直接判失败并指引重记**（吞吐与 rate/batch 强相关，不同 profile 比较无意义）。
+  - 执行顺序：compare **先于** summary 写出；`-summary` 与 `-compare` 同路径时警告（否则 compare 读到刚写出的本次结果，自己比自己），防御脚枪。
+- **Makefile** 三个目标（依赖 :8080 已运行）：
+  - `make bench` → 压测留痕 `.bench/latest.json`（不判定）；`make regress` → 压测 + 对比 `.bench/baseline.json`，退化非零退出；`make regress-baseline` → 当前结果覆盖基线。
+  - 可覆盖 `LOADGEN_BASEURL` / `BENCH_FLAGS`（默认 `-rate 2000 -duration 30s -concurrency 300 -variety 200`）。`.bench/` 已入 .gitignore（基线文件勿提交）。
+- **单测**（main_test.go，5 个）：同指标无回归 / 吞吐退化 / 延迟退化 / profile 不一致 / 基线缺失——`go test ./cmd/loadgen` 锁定回归判定逻辑。
+- **e2e 验证**（对运行中 :8080 小压测 100/s×2s×4 并发）：自身对比 PASS（ratio≈1.0）；伪造三份基线（吞吐×10 / 延迟×0.5 / rate 不同）→ 分别命中**吞吐回归 / p50+p99 延迟回归 / profile 不一致**，均非零退出；同路径脚枪有警告不静默。压测数据按名清理，DB 恢复 129 alerts / 123 last_alerts / 56 incidents / 孤立 0。
 
 ---
 
@@ -391,6 +403,12 @@ curl -X POST localhost:8080/api/v1/workflows/<wf-id>/run -H 'Content-Type: appli
 #   provider: { type: http, with: { url, method: PUT, headers: {X-Trace: "wf-{{.alert.name}}"},
 #               auth: {type: bearer, token: "tok-{{.alert.severity}}"}, body: "{\"x\":1}" } }
 # 并发不阻塞：含慢 http 步骤的工作流命中大量告警时，agent.run 等队列任务不被阻塞（执行已异步解耦）
+
+# ⑬ 回归基准（Phase 3f，需 :8080 已运行；首次先记录基线，之后 make regress 当回归看门狗）
+make bench            # 压测留痕 .bench/latest.json（不判定）
+make regress-baseline # 用当前环境结果记录 .bench/baseline.json（换环境/改参数后重记）
+make regress          # 压测 + 与基线对比：吞吐 <0.8× 或 P50/P99 >1.5× 基线 → 非零退出
+make regress BENCH_FLAGS="-rate 1000 -duration 10s"   # 覆盖压测参数（须与基线 profile 一致）
 ```
 
 ### e2e 实测结果（已通过，2026-08-07）
@@ -426,7 +444,7 @@ go test ./...                                              # 全包通过（含 
 cd web && npm run build                                    # tsc + vite build 通过
 ```
 
-单测覆盖：notifier（逐渠道 JSON 抓包断言/聚合/失败/跳过/URL 拼接/脱敏 + lifecycle 消息 created/resolved/LifecycleNotifier 发送且 audit=nil 不 panic/Reload 重建渠道含停用空 webhook 未知名忽略/BuildChannel 合法与非法/Supported）、circuit（4）、agent heal/change、ai/cluster（5：分组/gap 断开/键稳定/新增名换键/unknown 服务 + Summarize）、ai/llm（客户端默认值/chatURL 拼接/输出解析含围栏与缺 rootCause/EnhanceRCA 抓包断言请求与解析/401 错误/无 key 不带 Authorization/**EnhanceCluster 抓包断言 + parseClusterOutput 围栏与缺 summary/CompleteStream 流式累计逐 delta/流式中途超时/EnhanceRCA 流式分发与请求体 stream=true/非流式超时/SetTimeout 非正数忽略断言 http.Client.Timeout**）、agent/rca（无 LLM 不产生 llm* 字段/enhance 叠加与输入组装/fail-open 不写 llm* 字段/nil 输出忽略）、agent/heal（+**suggestedActions 合并 llm 建议去重顺序/非字符串忽略/Heal 回填 LLM 建议被 Resolve 收到**）、config（LLM 默认值与 env 命名：AIOPS_LLMAPIKEY/AIOPS_LLMTIMEOUTSEC/AIOPS_LLMSTREAM 生效 + 工作流扩展默认值 + **Phase 3 存储加固：连接池/重试/保留策略默认值与 env 命名（AIOPS_DBMAXOPENCONNS/AIOPS_DBCONNECTRETRIES/AIOPS_RETENTIONENABLED 等）**）、metrics（**Prometheus 文本输出精确行 + 直方图 +Inf 桶 + 未注册指标静默**）、workflow（Parse 校验/触发匹配 severity 范围+service+name/provider/无 filters/DedupKey 稳定/runSteps 顺序+fail-fast/renderTemplate + interval/manual 类型校验/Interval() 解析/httpStep method+headers+bearer 抓包断言/basic auth/renderTemplate nil alert/agentStep nil alert 报错）、alert、cel、incident、pipeline、util。
+单测覆盖：notifier（逐渠道 JSON 抓包断言/聚合/失败/跳过/URL 拼接/脱敏 + lifecycle 消息 created/resolved/LifecycleNotifier 发送且 audit=nil 不 panic/Reload 重建渠道含停用空 webhook 未知名忽略/BuildChannel 合法与非法/Supported）、circuit（4）、agent heal/change、ai/cluster（5：分组/gap 断开/键稳定/新增名换键/unknown 服务 + Summarize）、ai/llm（客户端默认值/chatURL 拼接/输出解析含围栏与缺 rootCause/EnhanceRCA 抓包断言请求与解析/401 错误/无 key 不带 Authorization/**EnhanceCluster 抓包断言 + parseClusterOutput 围栏与缺 summary/CompleteStream 流式累计逐 delta/流式中途超时/EnhanceRCA 流式分发与请求体 stream=true/非流式超时/SetTimeout 非正数忽略断言 http.Client.Timeout**）、agent/rca（无 LLM 不产生 llm* 字段/enhance 叠加与输入组装/fail-open 不写 llm* 字段/nil 输出忽略）、agent/heal（+**suggestedActions 合并 llm 建议去重顺序/非字符串忽略/Heal 回填 LLM 建议被 Resolve 收到**）、config（LLM 默认值与 env 命名：AIOPS_LLMAPIKEY/AIOPS_LLMTIMEOUTSEC/AIOPS_LLMSTREAM 生效 + 工作流扩展默认值 + **Phase 3 存储加固：连接池/重试/保留策略默认值与 env 命名（AIOPS_DBMAXOPENCONNS/AIOPS_DBCONNECTRETRIES/AIOPS_RETENTIONENABLED 等）**）、metrics（**Prometheus 文本输出精确行 + 直方图 +Inf 桶 + 未注册指标静默**）、workflow（Parse 校验/触发匹配 severity 范围+service+name/provider/无 filters/DedupKey 稳定/runSteps 顺序+fail-fast/renderTemplate + interval/manual 类型校验/Interval() 解析/httpStep method+headers+bearer 抓包断言/basic auth/renderTemplate nil alert/agentStep nil alert 报错）、loadgen（5：compare 同指标无回归/吞吐退化/延迟退化/profile 不一致/基线缺失）、alert、cel、incident、pipeline、util。
 
 ---
 
@@ -437,7 +455,7 @@ cd web && npm run build                                    # tsc + vite build �
 | ~~**LLM 深化**~~（✅ 已交付，Phase 2g） | 聚类摘要也接 LLM（非确定性模板）；LLM 建议动作回填 Heal；流式/超时可控 | ai + agent + web |
 | ~~**规模化**~~（✅ 已交付，Phase 3） | Postgres 加固、拓扑影响面（SQL 递归 CTE）、万级压测（10 倍余量达标）；Neo4j 后置仅替换 Impact 查询 | 全局 |
 | ~~**规模化延伸**~~（✅ 已交付，Phase 3b/3c/3d） | alerts 月分区 + 保留 DROP、CTE 单语句写入、规则引擎规则缓存、dedup 2 读合并（last_alerts 冗余 alert_hash）；批量写（D2）扫描论证后降级 | 全局 |
-| **规模化下一步**（候选） | 生产 HTTP 超时（WriteTimeout/IdleTimeout）按规格调优、`SaveAlerts` 批量写（需批内 overlay）、loadgen 接入 CI 回归基准 | 全局 |
+| **规模化下一步**（候选） | ~~生产 HTTP 超时按规格调优~~（✅ Phase 3e）~~loadgen 接入 CI 回归基准~~（✅ Phase 3f，`make bench/regress/regress-baseline`）；`SaveAlerts` 批量写（需批内 overlay，待真实 Alertmanager 大批次 push） | 全局 |
 
 基准报告见 **docs/PERF.md**（根因链/修复清单/服务端观测/建议）。
 

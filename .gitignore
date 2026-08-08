@@ -30,3 +30,6 @@ web/dist/
 # Env / secrets
 .env
 .env.local
+
+# loadgen 回归基准留痕（Phase 3f）
+/.bench/

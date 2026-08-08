@@ -132,7 +132,7 @@ bucket le=0.05   45079   le=0.1  70702   le=0.25  99644   le=0.5  110681
 
 1. **Linux 部署**：回环连接问题仅 Windows 开发态出现；连接池按实例规格调整。~~生产设置 `WriteTimeout`/`IdleTimeout`~~ **已落地（Phase 3e）**：全局 `ReadTimeout`（默认 15s）/`WriteTimeout`（30s）/`IdleTimeout`（120s），`ReadHeaderTimeout` 固定 5s 防 slowloris。**注意 WS 长连接**：coder/websocket hijack 后不清除 net/http 残留的读写 deadline，需在 WS handler（`hub.ServeWS`）Accept 前用 `http.NewResponseController` 显式清除（详见 PROGRESS.md Phase 3e）。gin debug 模式仍建议生产关闭。
 2. **真实告警洪峰**（如 100+ 万/min）：瓶颈在逐事件管线串行（~35ms/事件 ≈ 2 次 DB 往返 + 业务逻辑，dedup 与规则读均已缓存/单读）。方向：`SaveAlerts` 批量写（需批内去重 overlay，见上）、规则缓存 TTL 下调（`NewRuleEngine` 构造参数）、dedup 读并入写入语句（write-return-last-alert，进一步 2 往返 → 1 往返，但改动大需评估）
-3. **压测脚本化**：loadgen 已支持 `-rate/-duration/-concurrency/-variety/-batch`，可接入 CI 作为回归基准（失败率 >1% 即非零退出）
+3. ~~**压测脚本化**~~ **已落地（Phase 3f）**：loadgen 新增 `-summary`（JSON 汇总留痕）与 `-compare`（基线对比回归判定：吞吐 <0.8× 或 P50/P99 >1.5× 基线非零退出，profile 须一致）+ 容差可调；Makefile 封装 `make bench` / `make regress` / `make regress-baseline`（`.bench/` 已 gitignore）。首次 `make regress-baseline` 记录当前环境基线（**同环境同轮次比较才有效**），之后 `make regress` 当回归看门狗
 
 ### 当前环境复测说明（2026-08-08 Phase 3e 期间）
 
