@@ -385,4 +385,4 @@ make regress-batch            # 批量路径回归判定
 # 可覆盖：LOADGEN_BASEURL / BENCH_FLAGS（如 "-rate 1000 -duration 10s"）/ BENCH_BATCH
 ```
 
-详见 `docs/`：进度 [docs/PROGRESS.md](docs/PROGRESS.md)、压测基准 [docs/PERF.md](docs/PERF.md)、**架构与功能使用指南 [docs/GUIDE.md](docs/GUIDE.md)**。
+详见 `docs/`：进度 [docs/PROGRESS.md](docs/PROGRESS.md)、压测基准 [docs/PERF.md](docs/PERF.md)、架构与功能使用指南 [docs/GUIDE.md](docs/GUIDE.md)、**运维概念与黑话入门 [docs/GLOSSARY.md](docs/GLOSSARY.md)**（面向运维新手，术语逐个大白话解释）。

@@ -1,6 +1,6 @@
 # AIOps 告警平台 — 项目进度交接文档
 
-> 用途：跨会话/换窗口继续开发的现状快照。任何新窗口先读本文件 + README.md + **docs/GUIDE.md**（架构与功能使用深度指南）。
+> 用途：跨会话/换窗口继续开发的现状快照。任何新窗口先读本文件 + README.md + **docs/GUIDE.md**（架构与功能使用深度指南）+ **docs/GLOSSARY.md**（运维概念与黑话入门）。
 > 最后更新：2026-08-08（Phase 3d dedup 单读 P50 -30%/P99 -23%；Phase 3e HTTP 超时调优；Phase 3f loadgen CI 回归基准；Phase 3g SaveAlerts 批量写完成——batch 20 请求延迟 973→197ms）
 
 ---
