@@ -1,7 +1,3 @@
-# Reference repos (independent clones, not part of this project)
-/keep/
-/multi-agent-aiops/
-
 # Go build artifacts
 /aiops
 /aiops.exe
