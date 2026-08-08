@@ -265,4 +265,124 @@ deploy/            docker-compose（PostgreSQL）
 - **Phase 3f**：loadgen 接入 CI 回归基准 ✅（`-summary` JSON 汇总留痕 + `-compare` 基线对比判定：吞吐 <0.8× 或 P50/P99 >1.5× 基线非零退出、profile 须一致；Makefile `make bench` / `make regress` / `make regress-baseline`，本地无 remote 也能当回归看门狗）
 - **Phase 3g（当前最新）**：SaveAlerts 批量写 ✅（dedup 批量读 + 单语句多行 CTE 批量写合并为每批 2 次 DB 往返；批内 overlay 去重（禁裸延迟 flush）；last_alerts Go 侧折叠避免 PG「cannot affect row a second time」；批量读失败回退逐事件；`make bench-batch` / `make regress-batch` / `make regress-baseline-batch`——batch20 请求延迟 **973→197ms（-80%）**、失败率 5%→0%）
 
-详见 `docs/`：进度 [docs/PROGRESS.md](docs/PROGRESS.md)、压测基准 [docs/PERF.md](docs/PERF.md)。
+## 维护窗口（Phase 2b）
+
+计划性维护期间对告警热路径**静默**：命中窗口的 **firing** 告警以 `suppressed` 状态入库，**不触发**规则关联 / Incident / Agent 路径（resolved 一律放行，保证恢复链路）。窗口匹配需至少一个条件，且所有已配置条件全部满足；`severity` 为「覆盖 ≤ 该严重度」。
+
+```bash
+# ① 建窗口：周三 00:00–01:00 静默 pay 服务 ≤high 告警
+curl -X POST localhost:8080/api/v1/maintenance-windows -H 'Content-Type: application/json' \
+  -d '{"name":"pay 周三维护","service":"pay","severity":"high","startsAt":"2026-08-12T00:00:00Z","endsAt":"2026-08-12T01:00:00Z","reason":"DB 迁移","enabled":true}'
+# ② 窗口期内发 pay 的 medium/critical 告警 → 返回 processed，但入库 status=suppressed、
+#    广播 alert.suppressed，不建 Incident、不进 Agent
+# ③ 管理：GET/PUT/DELETE /api/v1/maintenance-windows[:id]（UI「维护窗口」页等价）
+
+# 注意：窗口 CRUD 后热路径缓存最长 5s 内生效（WindowFilter TTL）；窗口期内的 suppressed 同内容告警按 duplicate 处理
+#（避免窗口期心跳刷表），窗口失效后同内容复发重新上浮为 firing。
+```
+
+配置：窗口 CRUD 走 API/UI；`WindowFilter` 缓存 TTL 固定 5s（`pipe.InvalidateMaintenance(tenant)` 由 API 层自动调用）。
+
+## API 端点一览
+
+全部业务端点挂在 `/api/v1` 下（`authMiddleware` 注入租户；`noauth` 模式固定 `default` 租户，`apikey` 模式校验 `X-API-Key`）。`GET /healthz` 与 `GET /metrics` 不挂鉴权。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/webhook/:provider` | 接收告警 push（provider 为注册表 kind，如 `prometheus`），批量归一化入管线 → `{accepted, processed, events}` |
+| GET | `/alerts` | 告警列表 `?status=&severity=&provider=&from=&to=&limit=&offset=`（created_at 倒序） |
+| GET | `/alerts/:id` | 告警详情（DTO） |
+| GET | `/alerts/:id/history` | 同 fingerprint 去重演进历史（≤50 条） |
+| POST | `/alerts/:id/ack` | 确认告警（认领）→ status=`acknowledged` |
+| GET | `/incidents` | 事故列表 `?status=&limit=&offset=` |
+| GET | `/incidents/:id` | 事故详情（聚合关联告警 + 编排器状态 `state` + `nodeResults` monitor/rca/heal/change） |
+| POST | `/incidents/:id/resolve` | 手动解决（闭环）→ `{status:"resolved"}` |
+| POST | `/incidents/:id/approval` | 分级审批 `{decision: approve\|reject, actor, reason}` → approve 闭环 resolved / reject 保持 open |
+| GET | `/incidents/:id/audits` | 审计轨迹（who/when/what/why，correlation_id 贯穿） |
+| POST | `/notify/test` | 全渠道测试 `{title, content, severity}` → `{channels, results[]}` |
+| GET | `/notify/channels` | 渠道配置列表（含未启用） |
+| PUT | `/notify/channels/:name` | 更新渠道 `{enabled, webhook}`（保存即热重载；停用=静默） |
+| POST | `/notify/channels/:name/test` | 单渠道测试（无需启用） |
+| GET/POST | `/playbooks` | 自愈剧本列表 / 创建 |
+| PUT/DELETE | `/playbooks/:id` | 更新 / 删除剧本 |
+| GET/POST | `/maintenance-windows` | 维护窗口列表 / 创建 |
+| PUT/DELETE | `/maintenance-windows/:id` | 更新 / 删除窗口 |
+| POST | `/ai/cluster` | 手动触发一次 AI 聚类 → `{scanned, clusters, created[], merged}` |
+| GET/POST | `/workflows` | 工作流列表 / 创建（`yaml` 原文） |
+| PUT/DELETE | `/workflows/:id` | 更新 / 删除（更新时 `enabled` 用指针判定「未传」与 `false`） |
+| POST | `/workflows/:id/run` | 手动触发（`{alert_id?}`）→ `{runId, trigger:"manual", status}` |
+| GET | `/workflow-runs` | 运行记录（`trigger` 列 alert\|interval\|manual） |
+| GET/POST | `/rules` | CEL 关联规则列表 / 创建（`{name, celExpression, groupingCriteria[], threshold, runAgent, enabled}`） |
+| GET | `/providers` | 已注册数据源 provider 列表 |
+| GET/POST | `/topology` | 服务拓扑节点列表 / 创建（`{name, kind, dependsOn[], recentChanges[]}`） |
+| GET | `/topology/:name/impact` | 影响面 `?depth=N`（SQL 递归 CTE 反向遍历依赖图） |
+| POST | `/apikeys` | 创建 API key → `{apiKey(仅此一次明文), tenantId}` |
+| GET | `/ws` | WebSocket 实时推送（事件：`alert.new/update/duplicate/suppressed`、`incident.upsert`、`incident.state`） |
+| GET | `/healthz` | 健康检查 |
+| GET | `/metrics` | Prometheus 文本格式指标 |
+
+## 配置项（环境变量，前缀 `AIOPS_`）
+
+| 分组 | 变量 | 默认 | 说明 |
+|---|---|---|---|
+| 服务 | `AIOPS_ADDR` | `:8080` | HTTP 监听地址 |
+| 服务 | `AIOPS_LOGLEVEL` | `info` | `debug\|info\|warn\|error` |
+| HTTP | `AIOPS_HTTPREADTIMEOUTSEC` | `15` | 读请求（含 body）超时秒；WS 长连接不受影响 |
+| HTTP | `AIOPS_HTTPWRITETIMEOUTSEC` | `30` | 写响应超时秒（须 > `AIOPS_LLMTIMEOUTSEC`） |
+| HTTP | `AIOPS_HTTPIDLETIMEOUTSEC` | `120` | keep-alive 空闲超时秒 |
+| 存储 | `AIOPS_DBDRIVER` | `postgres` | 唯一支持（docker-compose 提供） |
+| 存储 | `AIOPS_DBDSN` | — | Postgres DSN（如 `host=127.0.0.1 user=aiops ... TimeZone=Asia/Shanghai`） |
+| 存储 | `AIOPS_DBMAXOPENCONNS` | `20` | 连接池最大打开数 |
+| 存储 | `AIOPS_DBMAXIDLECONNS` | `20` | 最大空闲数（= MaxOpen 防连接抖动） |
+| 存储 | `AIOPS_DBCONNMAXLIFETIMESEC` | `1800` | 连接最长存活秒（0 不限） |
+| 存储 | `AIOPS_DBCONNMAXIDLETIMESEC` | `300` | 空闲回收秒（0 不限） |
+| 存储 | `AIOPS_DBCONNECTRETRIES` | `5` | 启动连接重试（PG 未就绪时等待） |
+| 保留 | `AIOPS_RETENTIONENABLED` | `true` | 保留策略 worker 开关 |
+| 保留 | `AIOPS_RETENTIONALERTSDAYS` | `30` | alerts 明细保留天数（事故/当前状态不受影响） |
+| 保留 | `AIOPS_RETENTIONAUDITDAYS` | `180` | audit_logs 保留天数 |
+| 保留 | `AIOPS_RETENTIONWORKFLOWRUNSDAYS` | `90` | workflow_runs 保留天数 |
+| 保留 | `AIOPS_RETENTIONINTERVALMIN` | `60` | 清理执行间隔分钟 |
+| 分区 | `AIOPS_ALERTSPARTITIONS` | `true` | alerts 月分区（false 退回纯行级 DELETE，不提供反向迁移） |
+| 队列/总线/认证 | `AIOPS_QUEUEDRIVER` / `AIOPS_EVENTBUSDRIVER` / `AIOPS_AUTHTYPE` | `memory` / `memory` / `noauth` | `noauth` 固定 default 租户；`apikey` 校验 `X-API-Key` |
+| 通知 | `AIOPS_NOTIFIERCHANNELS` | — | 逗号分隔启用渠道 `dingtalk,feishu,wecom,http`（env 仅首启种子，DB 为准） |
+| 通知 | `AIOPS_NOTIFIER{DINGTALK,FEISHU,WECOM,HTTP}` | — | 各渠道 webhook 地址 |
+| 通知 | `AIOPS_NOTIFIERBASEURL` | `http://localhost:5173` | 前端地址（拼接事故详情链接） |
+| Agent | `AIOPS_AGENTDRYRUN` | `true` | 自愈动作默认 dry-run（安全优先） |
+| Agent | `AIOPS_AGENTENABLED` | `true` | 是否投递 agent.run 任务 |
+| Agent | `AIOPS_RCACONFIDENCE` | `0.3` | RCA 置信度门槛 |
+| Agent | `AIOPS_AGENTMAXDEPTH` | `5` | 依赖链遍历深度 |
+| Agent | `AIOPS_AGENTBLASTRADIUSLIMIT` | `0.2` | 爆炸半径超限强制降级 L2 |
+| Agent | `AIOPS_AGENTAUTOHEALLEVEL` | `L0` | 允许自动执行的最高级别（L0/L1/L2） |
+| LLM | `AIOPS_LLMAPIKEY` | — | 配置后启用（openai-compat）；未配置纯确定性 |
+| LLM | `AIOPS_LLMBASEURL` / `AIOPS_LLMMODEL` | `https://api.deepseek.com` / `deepseek-chat` | OpenAI 兼容端点 / 模型 |
+| LLM | `AIOPS_LLMTIMEOUTSEC` | `15` | 整体超时秒（流式累计期间生效） |
+| LLM | `AIOPS_LLMSTREAM` | `true` | SSE 流式响应 |
+| 聚类 | `AIOPS_AICLUSTER{ENABLED,THRESHOLD,WINDOWMIN,INTERVALSEC}` | `true`/`3`/`10`/`60` | 定时 worker / 达阈值确认 / 时间窗分钟 / 间隔秒 |
+| 工作流 | `AIOPS_WORKFLOWENABLED` | `true` | pipeline 投递 workflow.trigger 并消费 |
+| 工作流 | `AIOPS_WORKFLOWEXECWORKERS` | `8` | 工作流执行并发上限 |
+| 工作流 | `AIOPS_WORKFLOWSCHEDINTERVALSEC` | `10` | interval 触发器扫描间隔秒 |
+
+## 常用命令（Makefile）
+
+```bash
+make infra     # docker compose 启动 PostgreSQL
+make app       # go run ./cmd/aiops（:8080，内嵌默认 DSN）
+make build     # go build -o bin/aiops ./cmd/aiops
+make test / vet / tidy
+make web       # cd web && npm run dev（:5173）
+make web-build # 前端构建
+make clean     # rm -rf bin
+```
+
+压测回归基准（依赖 :8080 运行中，详见 docs/PERF.md）：
+
+```bash
+make bench                # 跑一次压测留痕 .bench/latest.json（不判定）
+make regress-baseline     # 记录当前环境基线 .bench/baseline.json（换环境/改参数后重记）
+make regress              # 压测 + 与基线对比，吞吐/P50/P99 退化非零退出（CI 看门狗）
+make regress-baseline-batch   # 记录批量路径基线（-batch 20）
+make regress-batch            # 批量路径回归判定
+# 可覆盖：LOADGEN_BASEURL / BENCH_FLAGS（如 "-rate 1000 -duration 10s"）/ BENCH_BATCH
+```
+
+详见 `docs/`：进度 [docs/PROGRESS.md](docs/PROGRESS.md)、压测基准 [docs/PERF.md](docs/PERF.md)、**架构与功能使用指南 [docs/GUIDE.md](docs/GUIDE.md)**。
