@@ -130,6 +130,12 @@ bucket le=0.05   45079   le=0.1  70702   le=0.25  99644   le=0.5  110681
 
 ## 建议（后续规模化）
 
-1. **Linux 部署**：回环连接问题仅 Windows 开发态出现；生产建议关闭 debug 模式 + 设置 `WriteTimeout`/`IdleTimeout`，连接池按实例规格调整
+1. **Linux 部署**：回环连接问题仅 Windows 开发态出现；连接池按实例规格调整。~~生产设置 `WriteTimeout`/`IdleTimeout`~~ **已落地（Phase 3e）**：全局 `ReadTimeout`（默认 15s）/`WriteTimeout`（30s）/`IdleTimeout`（120s），`ReadHeaderTimeout` 固定 5s 防 slowloris。**注意 WS 长连接**：coder/websocket hijack 后不清除 net/http 残留的读写 deadline，需在 WS handler（`hub.ServeWS`）Accept 前用 `http.NewResponseController` 显式清除（详见 PROGRESS.md Phase 3e）。gin debug 模式仍建议生产关闭。
 2. **真实告警洪峰**（如 100+ 万/min）：瓶颈在逐事件管线串行（~35ms/事件 ≈ 2 次 DB 往返 + 业务逻辑，dedup 与规则读均已缓存/单读）。方向：`SaveAlerts` 批量写（需批内去重 overlay，见上）、规则缓存 TTL 下调（`NewRuleEngine` 构造参数）、dedup 读并入写入语句（write-return-last-alert，进一步 2 往返 → 1 往返，但改动大需评估）
 3. **压测脚本化**：loadgen 已支持 `-rate/-duration/-concurrency/-variety/-batch`，可接入 CI 作为回归基准（失败率 >1% 即非零退出）
+
+### 当前环境复测说明（2026-08-08 Phase 3e 期间）
+
+- Phase 3e 改动为纯配置层（HTTP 超时），理论上零管线回归；为排除性能影响，同环境用 **HEAD 基线（d5dbdb7）** 编译对比压测：基线 P50 **162ms**，改动后 **86–172ms** 波动（多轮），**基线不更快 → 确认无回归**。
+- 但两轮均远高于 Phase 3d 记录值（33.1ms）：压测中采样 `pg_stat_activity`，PG 上**全部为 CTE 写入且大量 `LWLock`/`IO` 等待**——瓶颈在 PostgreSQL 写入侧的锁竞争 + Docker Desktop 磁盘 IO，非应用代码。阶段性的 DELETE 清理 + 反复压测会加剧表/索引膨胀（VACUUM 后反而更慢，波动 ±50ms）。
+- **结论**：Phase 3d 的 33.1ms 是当时磁盘/表状态下的稳态值；当前 Windows/Docker 环境的绝对数值不可复现。横向对比（同环境同轮次）才是有效判据。

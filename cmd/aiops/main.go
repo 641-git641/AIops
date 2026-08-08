@@ -250,7 +250,17 @@ func main() {
 	router.Use(gin.Recovery())
 	server.Register(router)
 
-	httpSrv := &http.Server{Addr: cfg.Addr, Handler: router, ReadHeaderTimeout: 5 * time.Second}
+	// 生产加固：ReadHeaderTimeout 固定 5s 防 slowloris；ReadTimeout/WriteTimeout 防慢
+	// 请求体/慢响应客户端占住 goroutine；IdleTimeout 回收僵尸 keep-alive 连接。WS 端点
+	// （hub.ServeWS）在 Accept 前显式清除底层连接的读/写 deadline，长连接不受误伤。
+	httpSrv := &http.Server{
+		Addr:              cfg.Addr,
+		Handler:           router,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       time.Duration(cfg.HTTPReadTimeoutSec) * time.Second,
+		WriteTimeout:      time.Duration(cfg.HTTPWriteTimeoutSec) * time.Second,
+		IdleTimeout:       time.Duration(cfg.HTTPIdleTimeoutSec) * time.Second,
+	}
 	go func() {
 		slog.Info("http listening", "addr", cfg.Addr)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

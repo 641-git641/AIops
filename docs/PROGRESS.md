@@ -1,7 +1,7 @@
 # AIOps 告警平台 — 项目进度交接文档
 
 > 用途：跨会话/换窗口继续开发的现状快照。任何新窗口先读本文件 + README.md。
-> 最后更新：2026-08-08（Phase 3c 规则缓存 `f7884fb`；Phase 3d dedup 单读完成，P50 -30%/P99 -23%）
+> 最后更新：2026-08-08（Phase 3c 规则缓存 `f7884fb`；Phase 3d dedup 单读完成，P50 -30%/P99 -23%；Phase 3e 生产 HTTP 超时调优完成）
 
 ---
 
@@ -135,7 +135,7 @@ Alert → process_event ──┬── 确定性热路径（去重 → 入库 �
 - **单测**（rule_engine_test.go，5 个）：TTL 内命中不重查 / TTL 过期重查 / Invalidate 强制重查且不影响他租户 / **loader 失败不污染缓存**（错误不写入缓存，恢复后正常）/ 并发访问安全（Windows 下 `-race` 工具链不可用，常规 -run 通过）。
 - **压测**（2000rps/300 并发/30s/variety 200，同 Phase 3b 基线）：**P50 51→47.4ms（-7%）、P99 88→80.7ms（-8%）**，吞吐 1795/s 持平（瓶颈仍在逐事件串行），失败率 0.026%。收益符合预期：规则读占 4 次往返的 1 次。
 - **e2e**：API 创建规则（critical + service=rcsmoke）→ 同条件告警 → 命中创建 `source=rule` incident（验证缓存命中路径 + Invalidate 后立即生效）；压测数据（alerts 4.2 万 + 8 个 loadgen AI 聚类 incident + 冒烟痕迹）按名清理，DB 恢复 129 alerts / 123 last_alerts / 2 rules / 56 incidents / 孤立 0。
-- **其余 lever**（尚未做）：`SaveAlerts` 批量写（需批内 overlay）、生产 HTTP 超时调优。
+- **其余 lever**（尚未做）：`SaveAlerts` 批量写（需批内 overlay）。生产 HTTP 超时调优已由 Phase 3e 落地。
 
 ### Phase 3d — dedup 单读（2 读合并）✅（当前最新）
 - **动机**：规则缓存（3c）后每事件管线剩余 3 次 DB 往返（dedup **2 读** + 写 1 次）——dedup 原为 `GetLastAlert`（读 last_alerts 唯一索引）+ `Get(la.AlertID)`（回读 alerts 分区表拿 hash/status）。
@@ -156,6 +156,13 @@ Alert → process_event ──┬── 确定性热路径（去重 → 入库 �
 
   **P50 -30%、P99 -23%**，吞吐持平（瓶颈已是写 1 次 + 业务逻辑）。收益比规则缓存更大——dedup 是每事件必走的 2 读。
 - **e2e**：三态验证——new（全新 fingerprint 入 1 行 alerts + 1 行 last_alerts）/ update（startsAt 变→hash 变→alerts 增行 + last_alerts 更新指向最新）/ duplicate（同 payload→alerts 不增）；`hash_matches_alerts=t` 证明 last_alerts.alert_hash == 当前活跃告警 hash；启动日志 `backfilled last_alerts.alert_hash rows=123`。压测/冒烟数据已清理，DB 恢复 129 alerts / 123 last_alerts / 56 incidents / 孤立 0。
+
+### Phase 3e — 生产 HTTP 超时调优 ✅（当前最新）
+- **动机**（docs/PERF.md 建议 #1 落地项）：生产要求设置 `WriteTimeout`/`IdleTimeout`，防慢响应客户端占住 goroutine、僵尸 keep-alive 连接占 fd；顺带补 `ReadTimeout`（慢 body）。
+- **配置**（`config.go` + `main.go`）：`http.Server` 从仅 `ReadHeaderTimeout:5s` 扩为四项——`ReadHeaderTimeout 5s`（固定，防 slowloris）+ `ReadTimeout`（默认 15s）+ `WriteTimeout`（默认 30s，**须 > LLMTimeoutSec**）+ `IdleTimeout`（默认 120s，对 WS 不生效）。env：`AIOPS_HTTPREADTIMEOUTSEC` / `AIOPS_HTTPWRITETIMEOUTSEC` / `AIOPS_HTTPIDLETIMEOUTSEC`。
+- **关键坑（必须记住）**：**coder/websocket hijack 后不会清除 net/http 落在底层连接上的读写 deadline（gorilla 有清、coder 没有）**。全局 `ReadTimeout` 直接 `SetReadDeadline` 残留、`WriteTimeout` 在 Go 1.26 是 readRequest 返回时 `defer SetWriteDeadline` 残留（不再是 timer）——WS 长连接会在超时秒数后读写被强制断开。修复：`hub.ServeWS` 在 `websocket.Accept` **前**用 `http.NewResponseController(w)` 清 `SetReadDeadline/SetWriteDeadline(time.Time{})`（沿 gin `ResponseWriter.Unwrap()` 到达底层 conn，Go 1.26 的 `response.SetReadDeadline` 直接转发无遮挡）。
+- **验证**：WS 探针连接在 `ReadTimeout=3s/WriteTimeout=4s` 下存活 10s+ 且实时收到 `alert.new/update/duplicate` 广播（deadline 清除生效）；REST 正常；`go build/vet/test` 全绿。
+- **性能**：纯配置层改动，无管线回归（同环境基线 d5dbdb7 对比 162ms vs 改动后 86ms，均受 PG 写入 LWLock/IO 瓶颈影响，见 PERF.md 当前环境说明）。
 
 ---
 
@@ -291,13 +298,13 @@ dry-run（`AIOPS_AGENTDRYRUN=true` 默认）→ 爆炸半径 >`AIOPS_AGENTBLASTR
 | 组件 | 状态 | 备注 |
 |---|---|---|
 | PostgreSQL | docker 容器（compose） | `deploy/docker-compose.yml`，DSN `host=127.0.0.1 user=aiops password=aiops dbname=aiops port=5432` |
-| 后端 | :8080 运行中（PID 13356，Phase 3d binary） | 启动命令含 `AIOPS_NOTIFIERCHANNELS=http AIOPS_NOTIFIERHTTP=http://localhost:9999/webhook AIOPS_NOTIFIERBASEURL=http://localhost:5173 ./bin/aiops.exe` |
+| 后端 | :8080 运行中（PID 20548，Phase 3e binary） | 启动命令含 `AIOPS_NOTIFIERCHANNELS=http AIOPS_NOTIFIERHTTP=http://localhost:9999/webhook AIOPS_NOTIFIERBASEURL=http://localhost:5173 ./bin/aiops.exe`；HTTP 超时默认 Read 15s / Write 30s / Idle 120s |
 | mock webhook | :9999 运行中（PID 28620） | `node deploy/mock_webhook.mjs 9999`，收到的通知打印到 stdout |
 | 前端 | Vite dev :5173 | `cd web && npm run dev` |
 
 > 注意：后台进程随 Claude 会话退出可能被终止，重开后按上表命令重启即可。
 
-> **⚠️ :8080 仍是旧二进制**（LLM 深化 + 通知补充 + 工作流扩展未生效）。重启后加载新代码：首启把 `AIOPS_NOTIFIERCHANNELS` 渠道种入 `notification_channels` 表，此后渠道以 UI/DB 为准；事故新建/解决也会推送生命周期通知；工作流 interval 调度器随启动运行；配置 `AIOPS_LLMAPIKEY` 后聚类摘要接 LLM（`AIOPS_LLMSTREAM=true` 默认流式、`AIOPS_LLMTIMEOUTSEC=15` 默认超时）。
+> 启动说明：首启把 `AIOPS_NOTIFIERCHANNELS` 渠道种入 `notification_channels` 表，此后渠道以 UI/DB 为准；事故新建/解决推送生命周期通知；工作流 interval 调度器随启动运行；配置 `AIOPS_LLMAPIKEY` 后聚类摘要接 LLM（`AIOPS_LLMSTREAM=true` 默认流式、`AIOPS_LLMTIMEOUTSEC=15` 默认超时）。HTTP 超时默认值即生产规格，无需额外 env。
 
 ### 重启后端命令
 ```bash

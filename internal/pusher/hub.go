@@ -67,6 +67,14 @@ func (h *Hub) Broadcast(e Event) {
 
 // ServeWS 升级 HTTP 连接为 WS 客户端。
 func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request, tenantID string) {
+	// 清除全局 HTTP 服务器超时（ReadTimeout/WriteTimeout）落在底层连接上的 deadline：
+	// net/http 在进入 handler 前已设置读写 deadline，而 coder/websocket hijack 后
+	// 不会清除它们（gorilla 有清、coder 没有）——不清理则 WS 长连接在超时秒数后
+	// 读写被强制断开。ResponseController 沿 gin ResponseWriter.Unwrap() 到达底层 conn。
+	rc := http.NewResponseController(w)
+	_ = rc.SetReadDeadline(time.Time{})
+	_ = rc.SetWriteDeadline(time.Time{})
+
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		InsecureSkipVerify: true, // 身份校验已在 API 中间件完成
 	})

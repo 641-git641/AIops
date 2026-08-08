@@ -12,6 +12,14 @@ type Config struct {
 	// 服务
 	Addr string // HTTP 监听地址，默认 :8080
 
+	// HTTP 服务器超时（生产加固）：防慢响应/慢 body/僵尸 keep-alive 连接占住资源。
+	// ReadHeaderTimeout 固定 5s 防 slowloris；WS 长连接不受影响——hub.ServeWS 在
+	// Accept 前显式清除 net/http 落在底层连接上的读/写 deadline（coder/websocket
+	// hijack 后不清除残留，不清理则超时秒后 WS 读写被强制断开）。
+	HTTPReadTimeoutSec  int // 读完整请求（含 body）超时秒（默认 15）
+	HTTPWriteTimeoutSec int // 写响应超时秒（默认 30；须 > LLMTimeoutSec）
+	HTTPIdleTimeoutSec  int // keep-alive 空闲超时秒（默认 120；对 WS 连接不生效，安全）
+
 	// 存储
 	DBDriver string // sqlite（默认）| postgres
 	DBDSN    string // sqlite 文件路径或 postgres DSN
@@ -134,6 +142,9 @@ func Load() (*Config, error) {
 	v.SetDefault("retentionworkflowrunsdays", 90)
 	v.SetDefault("retentionintervalmin", 60)
 	v.SetDefault("alertpartitions", true)
+	v.SetDefault("httpreadtimeoutsec", 15)
+	v.SetDefault("httpwritetimeoutsec", 30)
+	v.SetDefault("httpidletimeoutsec", 120)
 
 	return &Config{
 		Addr:                      v.GetString("addr"),
@@ -180,5 +191,8 @@ func Load() (*Config, error) {
 		RetentionWorkflowRunsDays: v.GetInt("retentionworkflowrunsdays"),
 		RetentionIntervalMin:      v.GetInt("retentionintervalmin"),
 		AlertPartitions:           v.GetBool("alertpartitions"),
+		HTTPReadTimeoutSec:        v.GetInt("httpreadtimeoutsec"),
+		HTTPWriteTimeoutSec:       v.GetInt("httpwritetimeoutsec"),
+		HTTPIdleTimeoutSec:        v.GetInt("httpidletimeoutsec"),
 	}, nil
 }
