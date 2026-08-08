@@ -1,5 +1,5 @@
 // Package topology 实现知识层：服务拓扑 + 依赖关系 + 近期变更。
-// 参考 multi-agent-aiops 的知识图谱：MVP 用 SQLite/Postgres 表 + 内存图遍历（BFS），Neo4j 后置可选。
+// MVP 用 SQLite/Postgres 表 + 内存图遍历（BFS），Neo4j 后置可选。
 package topology
 
 import (

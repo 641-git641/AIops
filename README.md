@@ -1,17 +1,17 @@
 # AIOps 告警平台
 
-融合 [keephq/keep](https://github.com/keephq/keep) 与 [multi-agent-aiops](https://github.com/bcefghj/multi-agent-aiops) 思路的告警平台。**双轨架构**：确定性规则热路径 + Agent 编排智能路径。
+由Golang搭建的AI告警平台。**双轨架构**：确定性规则热路径 + Agent 编排智能路径。
 
 ## 架构
 
 ```
-                    ┌── 确定性热路径（keep 式）──┐
+                    ┌── 确定性热路径             ──┐
 Alert → process_event ─┤ 去重→入库→CEL 规则关联 Incident ├→ WS 推送 / 审计
                     └── Agent 智能路径（编排器）──┘
                         monitor → rca → heal → change
 ```
 
-- **热路径**：两级去重（fingerprint 逻辑键 + alert_hash 物理键）、CEL 规则引擎、Incident 聚合、**YAML 工作流（keep 式，`provider: agent` 可切入 Agent 路径）**
+- **热路径**：两级去重（fingerprint 逻辑键 + alert_hash 物理键）、CEL 规则引擎、Incident 聚合、**YAML 工作流（`provider: agent` 可切入 Agent 路径）**
 - **Agent 路径**：severity≥high、规则命中或工作流显式接入 → `agent.run` 任务 → 编排器状态机（检查点落库）→ Monitor/RCA 根因（可选叠加 LLM 自然语言根因）→ **Heal 自愈（安全护栏链）→ Change 变更风险评估**
 - **自愈安全护栏链**：dry-run → 爆炸半径（超限强制降级 L2）→ 熔断器 → L0/L1/L2 分级审批（approve/reject 落审计四元组 who/when/what/why）
 - **AI 聚类/摘要**（背景 worker）：扫描未被规则/Agent 承接的散落告警（低/中危）→ 按服务+时间窗确定性聚类 → 达阈值确认生成 `source=ai` Incident（同键合并，名称/摘要随成员刷新）
@@ -103,7 +103,7 @@ curl -X POST localhost:8080/api/v1/ai/cluster
 
 ## Phase 2d：YAML 工作流引擎（已通过）
 
-keep 式 YAML 工作流：用户以 `workflow{id,triggers,filters[]}` + `steps[]`/`actions[]` 声明「告警命中 → 异步执行」，每步 `provider{type,with}`。内置 `provider: agent` 步骤可将告警接入 Agent 编排器（如 medium 告警默认不进 Agent 路径，通过工作流显式接入）。
+YAML 工作流：用户以 `workflow{id,triggers,filters[]}` + `steps[]`/`actions[]` 声明「告警命中 → 异步执行」，每步 `provider{type,with}`。内置 `provider: agent` 步骤可将告警接入 Agent 编排器（如 medium 告警默认不进 Agent 路径，通过工作流显式接入）。
 
 **并发防重（验收④）**：`workflow_runs` 表唯一索引 `(tenant_id, workflow_id, dedup_key)`，`dedup_key=SHA256(workflow_id:alert.fingerprint)`；并发首达仅一个赢者，同一工作流对同一告警只执行一次。
 
@@ -234,7 +234,7 @@ internal/
   notifier/         通知渠道（钉钉/飞书/企微/HTTP webhook + 审计联动）+ 生命周期通知（lifecycle.go）+ 渠道配置 DB 化（config_service.go，热重载）
   maintenance/      维护窗口（热路径静默：Window CRUD + 匹配 + WindowFilter 缓存）
   ai/               AI 聚类/摘要（确定性 cluster/summarize/service + 定时 worker）+ OpenAI 兼容 LLM 客户端（llm.go，RCA 增强）
-  workflow/         YAML 工作流引擎（keep 式 def/match/service + workflow_runs 并发防重 + interval 调度器 + 异步有界执行）
+  workflow/         YAML 工作流引擎（def/match/service + workflow_runs 并发防重 + interval 调度器 + 异步有界执行）
   provider/         数据源抽象 + 注册表（prometheus 等）
   topology/         服务拓扑（RCA 事实来源）
   eventbus/         事件总线 + 审计日志（AuditService 落库）

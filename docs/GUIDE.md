@@ -31,10 +31,10 @@
 
 ## 1. 总体架构
 
-AIops 是一个**双轨架构**的告警平台，融合了 [keephq/keep](https://github.com/keephq/keep)（确定性规则热路径 + YAML 工作流）与 multi-agent-aiops（Agent 编排智能路径）的思路：
+AIops 是一个**双轨架构**的告警平台：一条确定性规则热路径（去重/入库/规则关联 + YAML 工作流）+ 一条 Agent 编排智能路径：
 
 ```
-                    ┌─────────────── 确定性热路径（keep 式）───────────────┐
+                    ┌─────────────── 确定性热路径           ───────────────┐
 Alert → process_event ─┤ 归一化→维护窗口→两级去重→入库→CEL 规则关联 Incident ├→ WS 推送 / 审计 / 工作流
                     └─────────────── Agent 智能路径（编排器）──────────────┘
                         monitor → rca → heal → change（安全护栏链门控）
@@ -358,7 +358,7 @@ curl -X POST localhost:8080/api/v1/maintenance-windows -H 'Content-Type: applica
 
 ## 12. YAML 工作流引擎
 
-keep 式「定义即配置」：用户以 YAML 声明 `triggers` + `steps[]`/`actions[]`，命中告警时**异步**执行。
+「定义即配置」：用户以 YAML 声明 `triggers` + `steps[]`/`actions[]`，命中告警时**异步**执行。
 
 ### 12.1 结构
 

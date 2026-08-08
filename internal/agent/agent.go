@@ -1,4 +1,4 @@
-// Package agent 定义 Agent 抽象与上下文。参考 multi-agent-aiops：
+// Package agent 定义 Agent 抽象与上下文。
 // Agent 通过共享 IncidentState 接力，节点结果写入 NodeResults，条件路由由编排器判定。
 package agent
 

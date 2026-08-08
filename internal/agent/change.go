@@ -10,7 +10,7 @@ import (
 )
 
 // ChangeAgent 变更风险 Agent：对自愈动作做 5 维加权风险评分并给出分级审批建议。
-// 参考 multi-agent-aiops：爆炸半径 0.30 / 操作风险 0.25 / 时间风险 0.20 / 历史 0.15 / 关键度 0.10，
+// 5 维权重：爆炸半径 0.30 / 操作风险 0.25 / 时间风险 0.20 / 历史 0.15 / 关键度 0.10，
 // 评分分级 L0 自动 ≤0.3 / L1 oncall ≤0.5 / L2 tech-lead。审计四元组由审批环节落库。
 type ChangeAgent struct{}
 
@@ -20,7 +20,7 @@ func NewChangeAgent() *ChangeAgent { return &ChangeAgent{} }
 // Name Agent 名称。
 func (c *ChangeAgent) Name() string { return "change" }
 
-// weights 5 维风险权重（与参考实现对齐）。
+// weights 5 维风险权重。
 var weights = map[string]float64{
 	"blastRadius": 0.30,
 	"operation":   0.25,

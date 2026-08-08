@@ -1,5 +1,5 @@
 // Package provider 定义数据源接入抽象与注册表。
-// 参考 keep 的 BaseProvider + ProvidersFactory：统一抽象，注册表 + 编译期聚合。
+// 统一抽象 + 注册表 + 编译期聚合。
 package provider
 
 import (

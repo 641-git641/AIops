@@ -17,7 +17,7 @@ import (
 )
 
 // RuleEngine 关联规则引擎：对告警求值 CEL 规则，命中后按分组指纹聚合 Incident。
-// 参考 keep 的 RulesEngine + multi-agent-aiops 的编排条件路由。
+// 命中后条件路由到 Agent 流水线（编排器状态机）。
 type RuleEngine struct {
 	db  *gorm.DB
 	cel *cel.Engine

@@ -151,7 +151,7 @@ func main() {
 	// 5. 编排器（Agent 智能路径）
 	orch := buildOrchestrator(cfg, repo, svc, topoSvc, pbSvc, breaker, bus, hub, auditSvc, ntf, rcaLLM)
 
-	// 5.5 工作流引擎（keep 式 YAML 工作流，provider: agent 可调编排器）
+	// 5.5 工作流引擎（YAML 工作流，provider: agent 可调编排器）
 	// execWorkers 为执行并发上限：落库/防重在队列 worker 同步完成，执行异步有界并发，慢步骤不阻塞 agent.run
 	wfSvc := workflow.NewService(db, svc, orch, cfg.WorkflowExecWorkers)
 	_ = wfSvc.EnsureDefaults(context.Background(), "default") // 零配置补种演示工作流

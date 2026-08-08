@@ -1,4 +1,4 @@
-// Package maintenance 实现维护窗口（keep 式热路径静默）。
+// Package maintenance 实现维护窗口（热路径静默）。
 // 维护窗口按时间范围 + 匹配条件（fingerprint / service / severity 上限）
 // 对 firing 告警静默：pipeline 热路径命中后以 suppressed 状态入库，
 // 不触发规则关联 / Incident / Agent 路径。

@@ -14,8 +14,6 @@ type LastAlertReader interface {
 // Deduper 两级去重：
 //   - fingerprint（逻辑键）：同名同源告警视为同一逻辑告警
 //   - alert_hash（物理键）：内容哈希，相同 = 完全重复丢弃；不同 = 状态/内容刷新
-//
-// 参考 keep 的 AlertDeduplicator 与 multi-agent-aiops 的 AlertFingerprint。
 type Deduper struct {
 	repo LastAlertReader
 }

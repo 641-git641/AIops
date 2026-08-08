@@ -143,7 +143,7 @@ export default function Workflows() {
           ]}
         />
         <p style={{ color: '#999', fontSize: 12, marginTop: 8 }}>
-          keep 式 YAML 工作流：triggers（alert 告警命中 / interval 定时 / manual 手动「运行」按钮）时异步执行
+          YAML 工作流：triggers（alert 告警命中 / interval 定时 / manual 手动「运行」按钮）时异步执行
           steps/actions（provider: log | http | agent；http 支持 method/headers/auth）。同一工作流对同一告警只执行一次
           （workflow_runs 唯一键防并发）。
         </p>

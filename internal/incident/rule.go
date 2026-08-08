@@ -7,7 +7,7 @@ import (
 )
 
 // Rule 关联规则（correlation rule）：告警匹配 → 聚合生成 Incident。
-// 参考 keep 的 Rule 模型：CEL 表达式 + 分组字段 + create/resolve + threshold。
+// 模型：CEL 表达式 + 分组字段 + create/resolve + threshold。
 type Rule struct {
 	ID               string         `gorm:"primaryKey;size:36" json:"id"`
 	TenantID         string         `gorm:"size:64;index:idx_rule_tenant" json:"tenantId"`

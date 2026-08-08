@@ -1,5 +1,5 @@
 // Package circuit 实现熔断器（安全护栏链之一）。
-// 参考 multi-agent-aiops：三态 CLOSED → (连续失败达阈值) → OPEN(冷却期) → HALF_OPEN(试探) → CLOSED/OPEN。
+// 三态 CLOSED → (连续失败达阈值) → OPEN(冷却期) → HALF_OPEN(试探) → CLOSED/OPEN。
 // 自愈执行前必须通过 Allow()，熔断期间动作被阻断（fail-safe），防止故障级联。
 package circuit
 

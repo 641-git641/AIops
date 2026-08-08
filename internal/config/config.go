@@ -81,7 +81,7 @@ type Config struct {
 	AIClusterWindowMin   int  // 聚类时间窗口/回溯分钟（默认 10）
 	AIClusterIntervalSec int  // worker 执行间隔秒（默认 60）
 
-	// 工作流（keep 式 YAML 工作流引擎）
+	// 工作流（YAML 工作流引擎）
 	WorkflowEnabled          bool // 是否投递 workflow.trigger 任务并消费（默认 true）
 	WorkflowExecWorkers      int  // 工作流执行并发上限（慢步骤不阻塞队列 worker，默认 8）
 	WorkflowSchedIntervalSec int  // interval 触发器扫描间隔秒（默认 10）

@@ -1,5 +1,5 @@
 // Package pusher 实现实时推送：自研 WebSocket hub（~150 行）。
-// 参考 keep 的 pusher：后端 Broadcast 结构化事件，前端 WS 消费刷新。
+// 后端 Broadcast 结构化事件，前端 WS 消费刷新。
 // 扩展点：Broadcaster 接口保留替换为 soketi/Pusher 协议的余地。
 package pusher
 

@@ -1,5 +1,5 @@
 // Package pipeline 实现统一事件管线（双轨架构的确定性热路径）。
-// 参考 keep 的 process_event：归一化→维护窗口→去重→入库→规则关联→WS 推送→Agent 触发。
+// 环节：归一化→维护窗口→去重→入库→规则关联→WS 推送→Agent 触发。
 package pipeline
 
 import (
@@ -34,13 +34,13 @@ type Pipeline struct {
 	bus   eventbus.Bus
 	push  pusher.Broadcaster
 	q     queue.Queue
-	// maintenance 维护窗口过滤（keep 式热路径静默；默认放行）。
+	// maintenance 维护窗口过滤（热路径静默；默认放行）。
 	maintenance MaintenanceFilter
 	// Agent 触发策略
 	AgentTriggerSeverity string
 	// AgentEnabled 是否投递 agent.run 任务（由装配层按配置注入，默认 true）。
 	AgentEnabled bool
-	// workflowTrigger 投递 workflow.trigger 任务（keep 式工作流引擎；由装配层注入，默认 nil 关闭）。
+	// workflowTrigger 投递 workflow.trigger 任务（工作流引擎；由装配层注入，默认 nil 关闭）。
 	workflowTrigger func(ctx context.Context, a *alert.Alert)
 	// metrics 指标注册表（Phase 3 压测观测；nil 跳过埋点）。
 	m *metrics.Registry
@@ -257,7 +257,7 @@ func (p *Pipeline) ProcessEvent(ctx context.Context, e *alert.IngestEvent) (*Pro
 	}
 	a := e.BuildAlert()
 
-	// 1. 维护窗口过滤（keep 式热路径第 2 步）：命中 → 以 suppressed 入库，跳过规则/Incident/Agent
+	// 1. 维护窗口过滤（热路径第 2 步）：命中 → 以 suppressed 入库，跳过规则/Incident/Agent
 	suppressed, err := p.maintenance.IsSuppressed(ctx, a)
 	if err != nil {
 		slog.Warn("pipeline: maintenance filter", "alert", a.ID, "err", err)
@@ -323,7 +323,7 @@ func (p *Pipeline) finalizeSaved(ctx context.Context, a *alert.Alert, kind alert
 		p.triggerAgent(ctx, a, inc)
 	}
 
-	// 工作流触发（keep 式：用户定义工作流监听告警事件；异步投递，由 workflow 引擎去重）
+	// 工作流触发（用户定义工作流监听告警事件；异步投递，由 workflow 引擎去重）
 	if p.workflowTrigger != nil {
 		p.workflowTrigger(ctx, a)
 	}

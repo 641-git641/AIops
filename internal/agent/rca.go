@@ -21,7 +21,7 @@ type RCALLM interface {
 }
 
 // RCAAgent 根因分析 Agent：基于服务拓扑 + 近期变更做确定性贝叶斯式推断。
-// 参考 multi-agent-aiops：知识图反向 BFS 找候选 + 证据规则打分（recent_change 0.9 /
+// 知识图反向 BFS 找候选 + 证据规则打分（recent_change 0.9 /
 // metric_anomaly 0.8）+ 置信度门槛。确定性证据链之外，可注入 RCALLM 补充自然语言根因
 // 与建议动作（写入结果 llm* 字段）；未配置 LLM 或调用失败时保持结构化结论（fail-open）。
 // 告警平台场景下根因事实来源有限，采用启发式证据规则，失败也返回结构化结论。

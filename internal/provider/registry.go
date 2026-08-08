@@ -7,7 +7,7 @@ import (
 )
 
 // Registry provider 注册表。内置 provider 在各自包 init() 中 Register，
-// main 聚合 import 触发注册（Go 惯用法替代 keep 的 importlib 动态导入）。
+// main 聚合 import 触发注册（Go 惯用编译期聚合，替代运行时动态导入）。
 type Registry struct {
 	mu sync.RWMutex
 	m  map[string]Provider

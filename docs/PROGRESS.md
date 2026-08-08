@@ -7,8 +7,8 @@
 
 ## 0. 项目定位与一句话架构
 
-融合 **keephq/keep**（告警平台：Provider 归一化 + 确定性管线 + YAML 工作流）与
-**bcefghj/multi-agent-aiops**（多 Agent 智能运维：编排器状态机 + 分级自愈 + 安全护栏）。
+自研告警平台，**双轨架构**：确定性管线（Provider 归一化 + 热路径 + YAML 工作流）与
+多 Agent 智能运维（编排器状态机 + 分级自愈 + 安全护栏）两条路径。
 
 **双轨架构**：
 
@@ -17,7 +17,7 @@ Alert → process_event ──┬── 确定性热路径（去重 → 入库 �
                         └── Agent 智能路径（编排器 monitor → rca → heal → change，IncidentState 流转）
 ```
 
-- 热路径处理可确定性判断的：维护窗口/去重/规则关联/**YAML 工作流（keep 式，provider: agent 可切入 Agent 路径）**。
+- 热路径处理可确定性判断的：维护窗口/去重/规则关联/**YAML 工作流（provider: agent 可切入 Agent 路径）**。
 - Agent 路径处理需推理的：根因分析、自愈动作、变更风险，**决策不绕过审批**。
 - 背景 worker：AI 聚类/摘要兜底未被两条路径承接的散落告警（低/中危），生成 `source=ai` incident。
 - 两条路径共享：Incident 模型、事件总线（审计）、知识层（拓扑）、执行层（provider 反向复用）。
@@ -48,7 +48,7 @@ Alert → process_event ──┬── 确定性热路径（去重 → 入库 �
 
 ### Phase 2b — 维护窗口 ✅（当前最新）
 - **`internal/maintenance` 包**：`Window` 模型（tenant + 时间范围 + 匹配条件 fingerprint/service/severity 上限 + reason）+ Service（CRUD / ActiveWindows / Matches）。
-- **pipeline 热路径过滤**（keep 式第 2 步）：`WindowFilter` 按租户缓存活跃窗口（TTL 5s，CRUD 失效），命中 firing 告警 → 以 `suppressed` 状态入库，跳过规则/Incident/Agent，广播 `alert.suppressed`。
+- **pipeline 热路径过滤**（第 2 步）：`WindowFilter` 按租户缓存活跃窗口（TTL 5s，CRUD 失效），命中 firing 告警 → 以 `suppressed` 状态入库，跳过规则/Incident/Agent，广播 `alert.suppressed`。
 - **去重联动**：`dedup.Classify` 增加 `windowActive` 参数——窗口期内 suppressed 同内容算重复（防心跳刷表）；窗口失效后同内容**重新上浮为 firing** 并触发 Incident（e2e 已验证）。
 - **API**：`GET/POST/PUT/DELETE /api/v1/maintenance-windows`（校验时间合法 + 至少一个匹配条件）；前端导航「维护窗口」管理页（日期选择 + 生效中标注）。
 - e2e：pay 窗口期内告警 → `suppressed` + 0 incident；停用窗口后同告警 → `firing` + incident。
@@ -63,7 +63,7 @@ Alert → process_event ──┬── 确定性热路径（去重 → 入库 �
 - e2e：30 条 medium（pay×12/order×9/search×9）→ 3 个 source=ai incident；重跑 0 新建；同键新告警合并刷新。
 
 ### Phase 2d — YAML 工作流引擎 ✅
-- **`internal/workflow` 包**：keep 式 YAML schema（`workflow{id,name,disabled,triggers,filters[]}` + `steps[]`/`actions[]`，每步 `provider{type,with}`）。
+- **`internal/workflow` 包**：YAML schema（`workflow{id,name,disabled,triggers,filters[]}` + `steps[]`/`actions[]`，每步 `provider{type,with}`）。
 - **触发匹配**：`type: alert`（MVP）；filters 支持 severity（精确/`>=`/`<=`）、service（labels.service）、name/provider/source、任意 labels 键；无 filters 全命中。
 - **并发防重（验收④）**：`workflow_runs` 表唯一索引 `(tenant_id, workflow_id, dedup_key)`，`dedup_key=SHA256(workflow_id:alert.fingerprint)`；插入用 `OnConflict DoNothing` + `RowsAffected==0` 判定输掉竞态 → 不二次执行。同一工作流对同一告警（指纹）**只执行一次**，并发首达仅一个赢者。
 - **providers**：`log`（模板渲染 `{{.alert.*}}`，missingkey=zero）/ `http`（POST JSON，body 模板）/ `agent`（接入编排器）。
@@ -240,7 +240,7 @@ internal/
   notifier/         通知渠道（Message/Channel/Service + dingtalk/feishu/wecom/http）+ 事故生命周期通知（lifecycle.go）+ 渠道 DB 配置（ChannelConfig/ConfigService）
   maintenance/      维护窗口（Window 模型 + CRUD + ActiveWindows + Matches 匹配）
   ai/               AI 聚类/摘要（确定性 cluster/summarize/service）+ OpenAI 兼容 LLM 客户端（llm.go，RCA 增强）
-  workflow/         keep 式 YAML 工作流引擎（def/match/service + workflow_runs 并发防重 + interval 调度器 scheduler.go + 异步有界执行 launch）
+  workflow/         YAML 工作流引擎（def/match/service + workflow_runs 并发防重 + interval 调度器 scheduler.go + 异步有界执行 launch）
   topology/         服务拓扑（RCA 事实来源，ImpactScore）
   eventbus/         事件总线抽象 + AuditLog + AuditService 落库
   queue/            内存任务队列（单消费者按类型 dispatch：agent.run / workflow.trigger）

@@ -1,5 +1,5 @@
 // Package eventbus 实现事件总线抽象与审计日志。
-// 参考 multi-agent-aiops：Agent 间事件解耦 + correlation_id 全链路追踪 + 可审计。
+// Agent 间事件解耦 + correlation_id 全链路追踪 + 可审计。
 // MVP 用内存实现（编排器同步驱动 + 事件审计），Kafka 后置可选。
 package eventbus
 
@@ -9,7 +9,7 @@ import (
 	"gorm.io/datatypes"
 )
 
-// Topic 约定（与 multi-agent-aiops 对齐，去 aiops. 前缀简化）。
+// Topic 约定（去 aiops. 前缀简化）。
 const (
 	TopicAlerts    = "alerts"
 	TopicEvents    = "events"

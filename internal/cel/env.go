@@ -1,5 +1,5 @@
 // Package cel 封装 google/cel-go：构建环境、表达式预编译缓存、布尔求值。
-// 提供 keep 式"一处表达式处处复用"的基础：规则匹配、Agent 条件路由、告警过滤。
+// 提供「一处表达式处处复用」的基础：规则匹配、Agent 条件路由、告警过滤。
 package cel
 
 import (

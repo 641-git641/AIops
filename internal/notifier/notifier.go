@@ -1,5 +1,5 @@
 // Package notifier 通知渠道：审批/告警/处置结果经钉钉/飞书/企微/通用 webhook 推送。
-// 参考 keep 的 provider.notify 与 multi-agent-aiops 的审计联动。设计要点：
+// 通知与审计联动。设计要点：
 //   - 通知不阻断主流程（fail-open）：任一渠道失败只记审计，不影响审批闭环；
 //   - 未配置 webhook 的渠道自动跳过（Len()==0 时 Notify 返回空结果）；
 //   - 各渠道负责把 Message 渲染为对应格式（钉钉/企微 markdown、飞书卡片、通用 JSON）。

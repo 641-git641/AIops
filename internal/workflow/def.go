@@ -7,7 +7,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Def 工作流结构化定义（YAML → 内存对象，keep 式 schema 的精简版）。
+// Def 工作流结构化定义（YAML → 内存对象，声明式 schema 的精简版）。
 type Def struct {
 	Workflow DefWorkflow `yaml:"workflow"`
 }

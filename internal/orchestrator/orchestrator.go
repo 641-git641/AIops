@@ -1,5 +1,5 @@
 // Package orchestrator 实现多 Agent 编排器状态机。
-// 参考 multi-agent-aiops：WorkflowNode{Name, Agent, Condition, MaxRetries} 顺序流水线，
+// WorkflowNode{Name, Agent, Condition, MaxRetries} 顺序流水线，
 // 条件不满足自动跳过（fail-open），节点失败重试后不中断流程，每节点后检查点落库可恢复。
 package orchestrator
 

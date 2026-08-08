@@ -9,7 +9,7 @@ import (
 
 // Fingerprint 计算告警逻辑去重键。
 // 语义：相同 provider + 名称 + 关键标签（排除易变字段）的告警视为同一逻辑告警。
-// 参考 multi-agent-aiops 的 AlertFingerprint（名称+目标+sorted labels）与 keep 的 fingerprint。
+// 参与指纹的字段：名称 + 目标 + 排序后标签。
 func Fingerprint(provider, name string, labels map[string]any) string {
 	// 参与指纹的标签：排除易变/无意义的字段
 	exclude := map[string]bool{"timestamp": true, "startsAt": true, "endsAt": true, "instance": true, "job": true}

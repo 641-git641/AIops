@@ -26,7 +26,7 @@ type topoGetter interface {
 }
 
 // HealAgent 自愈 Agent：依据 RCA 根因建议动作 → 匹配 Playbook → 计算爆炸半径 → 分级审批。
-// 参考 multi-agent-aiops 安全护栏链：dry-run → 爆炸半径（超限强制降级 L2）→ 熔断器 → L0/L1/L2 分级。
+// 安全护栏链：dry-run → 爆炸半径（超限强制降级 L2）→ 熔断器 → L0/L1/L2 分级。
 // 默认 dry_run=true，故结果通常为 status=dry_run + 需要审批（演示审批闭环）。
 type HealAgent struct {
 	pb   playbookFinder

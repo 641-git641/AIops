@@ -1,5 +1,5 @@
 // Package playbook 实现自愈剧本表（数据驱动，可 UI 管理）。
-// 参考 multi-agent-aiops：Playbook 表驱动自愈动作（level / command / blast_radius_factor / rollback），
+// Playbook 表驱动自愈动作（level / command / blast_radius_factor / rollback），
 // 爆炸半径超标强制降级 L2，默认 dry-run（安全优先）。
 package playbook
 

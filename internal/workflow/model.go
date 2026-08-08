@@ -1,4 +1,4 @@
-// Package workflow 实现 keep 式 YAML 工作流引擎。
+// Package workflow 实现 YAML 工作流引擎。
 // 用户以 YAML 声明 triggers（监听告警）+ steps/actions（provider 执行，provider: agent 可调 Agent 编排），
 // 命中告警时异步执行；workflow_runs 以 (tenant_id, workflow_id, dedup_key) 唯一约束实现「并发防重」——
 // 同一工作流对同一告警（fingerprint）只执行一次，并发首达时由 DB 唯一索引裁决。
@@ -17,13 +17,13 @@ const (
 	RunFailed    = "failed"
 )
 
-// Workflow 工作流定义（原始 YAML 存储，触发时解析；keep 式「定义即配置」）。
+// Workflow 工作流定义（原始 YAML 存储，触发时解析；「定义即配置」）。
 type Workflow struct {
 	ID          string    `gorm:"primaryKey;size:36" json:"id"`
 	TenantID    string    `gorm:"size:64" json:"tenantId"`
 	Name        string    `gorm:"size:128" json:"name"`
 	Description string    `gorm:"size:512" json:"description"`
-	YAML        string    `gorm:"type:text" json:"yaml"` // keep 式原始定义
+	YAML        string    `gorm:"type:text" json:"yaml"` // 原始定义
 	Enabled     bool      `json:"enabled"`
 	CreatedAt   time.Time `json:"createdAt"`
 	UpdatedAt   time.Time `json:"updatedAt"`
