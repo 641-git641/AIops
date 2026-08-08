@@ -23,18 +23,16 @@ func NewRepository(db *gorm.DB) *Repository {
 	return &Repository{db: db}
 }
 
-// SaveAlert 在单事务中写入 alerts 并 upsert last_alerts。
+// SaveAlert 写入 alerts 并 upsert last_alerts（单语句双表写入，写入优化）：
+// WITH ins AS (INSERT alerts ... RETURNING) INSERT last_alerts ... ON CONFLICT。
+// 每事件 DB 往返 4 次（BEGIN/INSERT/UPSERT/COMMIT）→ 1 次，单语句原子性不变。
 // kind 为去重分类结果：new/update 写入，duplicate 跳过。
 func (r *Repository) SaveAlert(ctx context.Context, a *Alert, kind DedupKind) error {
 	if kind == DedupDuplicate {
 		return nil // 完全重复：不入库
 	}
-	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Create(a).Error; err != nil {
-			return err
-		}
-		return r.upsertLastAlert(tx, a)
-	})
+	sql, args := buildSaveSQL(a)
+	return r.db.WithContext(ctx).Exec(sql, args...).Error
 }
 
 // UpsertLastAlert 单独刷新状态缓存（如规则引擎、确认操作时）。

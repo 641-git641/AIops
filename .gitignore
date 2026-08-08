@@ -5,6 +5,7 @@
 # Go build artifacts
 /aiops
 /aiops.exe
+/loadgen.exe
 /bin/
 *.test
 

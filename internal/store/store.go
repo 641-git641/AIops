@@ -42,6 +42,7 @@ type Options struct {
 	ConnMaxLifetime time.Duration // 连接最长存活（默认 30min；<=0 表示不限）
 	ConnMaxIdleTime time.Duration // 空闲连接回收（默认 5min；<=0 表示不限）
 	ConnectRetries  int           // 启动连接重试次数（默认 5，postgres 未就绪时等待拉起）
+	AlertPartitions bool          // alerts 月分区（规模化延伸；由 config 提供默认 true——bool 零值无法回退，直接使用调用方值）
 }
 
 // Open 打开 PostgreSQL 连接：连接池调优 + 启动重试 + 自动迁移。
@@ -76,7 +77,7 @@ func Open(dsn string, opts Options) (*gorm.DB, error) {
 	if err := pingWithRetry(sqlDB, opts.ConnectRetries); err != nil {
 		return nil, err
 	}
-	if err := migrate(db); err != nil {
+	if err := migrate(db, opts.AlertPartitions); err != nil {
 		return nil, err
 	}
 	return db, nil
@@ -119,9 +120,11 @@ func pingWithRetry(sqlDB interface{ PingContext(context.Context) error }, retrie
 	return fmt.Errorf("store: postgres unreachable after %d attempts: %w", retries, lastErr)
 }
 
-// migrate 自动建表。所有模型在这里集中注册。
-// AutoMigrate 会补齐模型标签中新增的索引（如保留策略清理用的 created_at 索引）。
-func migrate(db *gorm.DB) error {
+// migrate 自动建表 + 可选 alerts 分区化。所有模型在这里集中注册。
+// 顺序：先 AutoMigrate（首次启动空库时建出普通表）→ 再分区化（原地迁移为分区表，
+// 幂等；已分区时仅维护当月/次月分区）。AutoMigrate 后续启动在分区父表上 diff
+// 列与索引（PG11+ CREATE INDEX 父表自动传播到分区，环境 PG16）。
+func migrate(db *gorm.DB, alertPartitions bool) error {
 	models := []any{
 		&alert.Alert{},
 		&alert.LastAlert{},
@@ -140,5 +143,11 @@ func migrate(db *gorm.DB) error {
 		&auth.APIKey{},
 		&eventbus.AuditLog{},
 	}
-	return db.AutoMigrate(models...)
+	if err := db.AutoMigrate(models...); err != nil {
+		return err
+	}
+	if alertPartitions {
+		return ensureAlertPartitions(db)
+	}
+	return nil
 }

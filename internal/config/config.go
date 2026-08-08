@@ -30,6 +30,9 @@ type Config struct {
 	RetentionWorkflowRunsDays int  // workflow_runs 保留天数（默认 90）
 	RetentionIntervalMin      int  // 清理执行间隔分钟（默认 60）
 
+	// 分区化（规模化延伸）：alerts 按 created_at 月分区，保留策略整分区 DROP 清理
+	AlertPartitions bool // alerts 月分区开关（默认 true；关闭则保留策略退回行级 DELETE，分区表降级可用）
+
 	// 队列
 	QueueDriver string // memory（默认）| asynq
 
@@ -130,6 +133,7 @@ func Load() (*Config, error) {
 	v.SetDefault("retentionauditdays", 180)
 	v.SetDefault("retentionworkflowrunsdays", 90)
 	v.SetDefault("retentionintervalmin", 60)
+	v.SetDefault("alertpartitions", true)
 
 	return &Config{
 		Addr:                      v.GetString("addr"),
@@ -175,5 +179,6 @@ func Load() (*Config, error) {
 		RetentionAuditDays:        v.GetInt("retentionauditdays"),
 		RetentionWorkflowRunsDays: v.GetInt("retentionworkflowrunsdays"),
 		RetentionIntervalMin:      v.GetInt("retentionintervalmin"),
+		AlertPartitions:           v.GetBool("alertpartitions"),
 	}, nil
 }

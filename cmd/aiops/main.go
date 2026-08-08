@@ -58,6 +58,7 @@ func main() {
 		ConnMaxLifetime: time.Duration(cfg.DBConnMaxLifetimeSec) * time.Second,
 		ConnMaxIdleTime: time.Duration(cfg.DBConnMaxIdleTimeSec) * time.Second,
 		ConnectRetries:  cfg.DBConnectRetries,
+		AlertPartitions: cfg.AlertPartitions,
 	})
 	if err != nil {
 		slog.Error("store open", "err", err)
@@ -212,9 +213,10 @@ func main() {
 	}
 
 	// 6.6 数据保留策略 worker：alerts/audit_logs/workflow_runs 按天分级保留、分批删除（可 AIOPS_RETENTIONENABLED=false 关闭）
+	// alerts 分区表模式：整月过期分区 DROP + 当月残余行级 DELETE（AIOPS_ALERTSPARTITIONS=false 退回纯行级删除）
 	if cfg.RetentionEnabled {
 		retSvc := retention.New(db, []retention.Rule{
-			{Table: "alerts", TimeColumn: "created_at", Days: cfg.RetentionAlertsDays},
+			{Table: "alerts", TimeColumn: "created_at", Days: cfg.RetentionAlertsDays, DropPartitions: cfg.AlertPartitions},
 			{Table: "audit_logs", TimeColumn: "created_at", Days: cfg.RetentionAuditDays},
 			{Table: "workflow_runs", TimeColumn: "started_at", Days: cfg.RetentionWorkflowRunsDays},
 		})

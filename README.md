@@ -257,6 +257,7 @@ deploy/            docker-compose（PostgreSQL）
 - **Phase 2e**：通知补充 ✅（事故生命周期通知 + 渠道管理 UI）
 - **Phase 2f**：工作流扩展 ✅（interval/manual 触发 + http step headers/认证 + 并发执行）、LLM 深化
 - **Phase 2g**：LLM 深化 ✅（聚类/摘要/RCA 增强全链路 LLM 可选 + 流式）
-- **Phase 3（当前最新）**：规模化 ✅（Postgres 加固：连接池/启动重试/索引/保留策略；拓扑影响面 SQL 递归 CTE；万级压测 **1786/s**（≈10.7 万/min）10 倍余量达标；Neo4j 后置仅替换 Impact 查询）
+- **Phase 3**：规模化 ✅（Postgres 加固：连接池/启动重试/索引/保留策略；拓扑影响面 SQL 递归 CTE；万级压测 **1786/s**（≈10.7 万/min）10 倍余量达标；Neo4j 后置仅替换 Impact 查询）
+- **Phase 3b（当前最新）**：写入优化 ✅（SaveAlert 单 SQL 双表写入——每事件往返 4→1，P50 61→51ms；alerts 按 created_at 月分区 + 保留策略整分区 DROP；loadgen `-batch` 批量扫描论证批量写降级；`AIOPS_ALERTSPARTITIONS` 默认 true）
 
 详见 `docs/`：进度 [docs/PROGRESS.md](docs/PROGRESS.md)、压测基准 [docs/PERF.md](docs/PERF.md)。

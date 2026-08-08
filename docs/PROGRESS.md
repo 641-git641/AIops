@@ -109,7 +109,28 @@ Alert → process_event ──┬── 确定性热路径（去重 → 入库 �
 - **e2e**（独立实例 :8081 + mock :9998，`AIOPS_LLMSTREAM=true`）：① 流式 RCA——critical order 告警 → rca 节点 `rootCause=recent_change`（确定性保留）+ `llmRootCause/llmSuggestedActions`（mock 经 SSE 返回，mock 日志 `stream=true type=rca`）；② Heal 回填——heal 节点 `reason` 显示合并列表 `rollback、profiling、verify_dependency、重启连接池、回滚 v1.2.3、扩容 db 副本`（确定性 + LLM 全量传入 Resolve）；③ 聚类摘要——4 条 medium pay → `POST /ai/cluster` → source=ai incident 同时有确定性 `summary` 与 `llmSummary`，同键新告警合并后名称/摘要/llmSummary 同步刷新；④ fail-open——停 mock 后新簇 → 确定性 summary 保留、无 llmSummary、warn「cluster llm enhance skipped」，建事故不受影响。
 - **review 修复**：`confirm` 的 LLM 增强从 Create 后、AttachAlert 前移到两者之后（消除孤儿事故窗口）；`refreshMerged` 的 `UpdateLLMSummary` 失败从 return error 改为 warn（fail-open 一致）；`Client.timeout` 死字段移除（实际生效的是 `http.Client.Timeout`）；`UpdateLLMSummary` 注释不再声称 source=ai 硬约束；`TestHealBlockedByOpenBreaker` 熔断冷却期 `60`（ns）→ `60*time.Second`（消除时序 flake）；新增流式中途超时单测。
 
-### Phase 3 — 规模化（Postgres 加固 + 万级压测 + 拓扑影响面）✅（当前最新）
+### Phase 3b — 写入优化（规模化延伸）✅（当前最新）
+- **D1 单 SQL 双表写入**（`internal/alert/save_sql.go` + `repository.SaveAlert`）：alerts insert + last_alerts upsert 合并为一条 `WITH ins AS (INSERT ... RETURNING) INSERT ... ON CONFLICT`，**每事件 DB 往返 4 次 → 1 次**（单语句原子，语义不变；suppressed 路径自动共用）。列清单收敛在 `buildSaveSQL`（单一事实来源 + 纯函数单测）。实测（同 Phase 3 参数 2000rps/300 并发）：**P50 61→51ms（-17%）、P99 100→88ms（-12%）**，吞吐 1790/s 持平（瓶颈已不在单次写入往返）。
+- **D4 loadgen `-batch`**（`cmd/loadgen`）：-rate 恒为事件/秒，请求速率 = rate/batch；批内按全局事件序号分配（fingerprint 互异）；汇总按事件折算（失败率阈值/吞吐）。
+- **批量写（D2）论证后降级不做**：batch 20/50/100 扫描（2000 事件/s 恒速）——
+  | batch | 请求延迟 P50 | 事件吞吐 | 失败率 |
+  |---|---|---|---|
+  | 1 | 51ms | 1790/s | 0.14% |
+  | 20 | 973ms | 1621/s | 5% |
+  | 50 | 2072ms | 1317/s | 12% |
+  | 100 | 3769ms | 1000/s | 31% |
+  请求延迟 ≈ batch × 50ms：**每事件管线耗时恒定**（dedup 2 读 + 规则 1 读 + 写 1 次 ≈ 4 次 DB 往返）。批量写（`SaveAlerts` 多行）只优化写的一次且需批内内存去重 overlay——**禁止裸延迟 flush（破坏批内去重正确性）**。扩展点（`SaveAlerts` + Deduper overlay 注入位）记录于 docs/PERF.md，待真实 Alertmanager 大批次 push 出现时立项。batch 失败均为 `refused`（长请求占连接 → Windows 回环耗尽），非服务端故障。
+- **D3 alerts 月分区 + 保留策略 DROP PARTITION**（`internal/store/partitions.go` + `internal/retention`）：
+  - 迁移（`migrate` 内 AutoMigrate 后原地执行，事务内幂等）：RENAME → CREATE 分区父表（**PK (id, created_at)**，PG 分区唯一约束必须含分区键；B-tree 左前缀保 `WHERE id=?` 走索引）→ 存量覆盖分区（min 首月→次月）+ `alerts_default` 兜底 → 分批搬迁 → DROP legacy。已分区时仅维护当月/次月 + default（跨月自动补建）。
+  - **review 修复：AutoMigrate 先建索引于普通表，RENAME/DROP legacy 时被带走** → 迁移后 `ensureAlertIndexes` 幂等补建（父表 CREATE INDEX → PG 自动传播全部分区）。
+  - 保留策略：Rule 加 `DropPartitions`，先 DROP 整月过期分区（`pg_class JOIN pg_inherits` + 分区名正则 `^alerts_p\d{6}$` 白名单；`alerts_default` 永不 drop）→ 行级 DELETE 兜底当月残余（30d 场景：6 月 DROP + 7 月残余行删除）。
+  - 配置：`AIOPS_ALERTSPARTITIONS`（默认 true；关闭退回纯行级 DELETE，已分区表降级可用；**不提供反向迁移**）。
+- **e2e**（独立实例 :8081）：① D1 功能——同 fingerprint 两事件 → 2 行 alerts + 1 行 last_alerts 指向最新，孤立 0；② 路由——6/29、7/4 行落 `alerts_default` 兜底分区；③ 保留清理——6 月分区 `retention: dropped partition alerts_p202606` + default 中 7/4 行 `cleaned rows=1`；④ 兼容——:8080 主实例（Phase 3 binary）写入分区表正常（落 8 月分区）；⑤ 压测对比与 batch 扫描见上。
+- **数据清理**：压测数据（alerts 11.6 万行 + 关联 ati/incidents/last_alerts）按名清理，DB 恢复 129 alerts / 123 last_alerts / 孤立 0；incidents 56 行（rule/agent/ai 真实数据）保留。
+
+---
+
+### Phase 3 — 规模化（Postgres 加固 + 万级压测 + 拓扑影响面）✅
 - **Postgres 加固**：
   - **连接池调优**（`config` + `store.Open`）：`DBMaxOpenConns`（默认 20）/ `DBMaxIdleConns`（默认 **= MaxOpen**）/ `DBConnMaxLifetimeSec`（1800）/ `DBConnMaxIdleTimeSec`（300）；`AIOPS_DBMAXOPENCONNS=50 AIOPS_DBMAXIDLECONNS=50` 已验证。**MaxIdle=MaxOpen 是关键修复**：压测中现 `connectex: Only one usage of each socket address`（Windows 回环 TIME_WAIT 冲突，空闲连接重连导致），对齐后 dial 错误归零。
   - **启动重试**：`DBConnectRetries=5`（Ping 3s 超时 + 2s 退避），compose Postgres 未就绪不炸。

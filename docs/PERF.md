@@ -72,8 +72,38 @@ bucket le=0.05   45079   le=0.1  70702   le=0.25  99644   le=0.5  110681
 - 验证：`p3-pay` 故障 → cart(1)/order(1)/checkout(2)/web(3) 影响面正确；depth=1 限制正确
 - 扩展点：Neo4j 后置时仅替换该查询（接口与返回结构不变）
 
+## 写入优化（规模化延伸，2026-08-08）
+
+### D1：单 SQL 双表写入（CTE）
+
+- 每事件 DB 往返 **4 次（BEGIN/INSERT/UPSERT/COMMIT）→ 1 次单语句**：`WITH ins AS (INSERT alerts ... RETURNING) INSERT last_alerts ... ON CONFLICT`（`internal/alert/save_sql.go`，单语句原子语义不变）。
+- 实测（2000rps/300 并发/30s，同 Phase 3 参数）：**P50 61→51ms（-17%）、P99 100→88ms（-12%）**，吞吐 1790/s 持平——单次写入往返已不再是瓶颈，剩余 ~50ms/事件为管线串行成本（dedup 2 读 + 规则 1 读 + 写 1 次 ≈ 4 次 DB 往返 + 业务逻辑）。
+- 注意：JSON 列必须 `string(datatypes.JSON)` + `?::jsonb` 绑定（直接传 []byte 会被 pgx 编成 bytea 报 cast 错误）；raw Exec 无 GORM 自动回填 CreatedAt/UpdatedAt，需 Go 侧回填。
+
+### D4：批量扫描结论（批量写 D2 降级依据）
+
+`loadgen -batch N`（-rate 恒为事件/秒；2000 事件/s、300 并发、variety 400）：
+
+| batch | 请求延迟 P50 | 事件吞吐 | 失败率 |
+|---|---|---|---|
+| 1 | 51ms | 1790/s | 0.14% |
+| 20 | 973ms | 1621/s | 5% |
+| 50 | 2072ms | 1317/s | 12% |
+| 100 | 3769ms | 1000/s | 31% |
+
+- **请求延迟 ≈ batch × 50ms（每事件处理时间恒定）** → 瓶颈是逐事件管线串行，不是语句本身。
+- 批量写（`SaveAlerts` 多行 insert）只优化 4 次往返中的写 1 次，且需要批内内存去重 overlay（同批同 fingerprint 事件 2 必须看到事件 1 的 last_alerts 状态）——**禁止裸延迟 flush**。本阶段不做，扩展点：`Repository.SaveAlerts(ctx, []*Alert, []DedupKind)` + Deduper overlay 注入位；待真实 Alertmanager 大批次 push 出现时立项。
+- batch 失败全为 `refused`（单请求时长 1s+ 占连接 → Windows 回环 accept 队列耗尽），非服务端故障（Linux 部署无此边缘行为）。
+
+### D3：alerts 月分区 + 保留策略 DROP PARTITION
+
+- 迁移（启动时 AutoMigrate 后原地执行，事务内幂等）：RENAME → 分区父表（PK `(id, created_at)`）→ 存量覆盖分区 + `alerts_default` 兜底 → 分批搬迁 → DROP legacy。已分区仅维护当月/次月 + default。
+- 保留策略：整月过期分区 **DROP（零 WAL、无锁表）** + 当月残余行级 DELETE 兜底（e2e：6 月分区 DROP + 7 月残余行删除双路径验证通过）。
+- 兼容性：Phase 3 binary 写分区表正常（透明路由）；`AIOPS_ALERTSPARTITIONS=false` 降级为纯行级 DELETE（已分区表可用，**不提供反向迁移**）。
+- 踩坑记录：① AutoMigrate 先建索引于普通表，RENAME/DROP legacy 时被带走 → 迁移后需 `ensureAlertIndexes` 幂等补建（父表建 → PG 自动传播）；② default 分区已有数据时补建历史分区会报 `updated partition constraint ... would be violated`（PG 语义：先清数据再建分区）；③ GORM AutoMigrate 不建分区表，列 DDL 需手动逐列对齐真实表（varchar(n)/jsonb/timestamptz）。
+
 ## 建议（后续规模化）
 
 1. **Linux 部署**：回环连接问题仅 Windows 开发态出现；生产建议关闭 debug 模式 + 设置 `WriteTimeout`/`IdleTimeout`，连接池按实例规格调整
-2. **真实告警洪峰**（如 100+ 万/min）：瓶颈将转向 DB 写入（alerts 表每事件 1 insert + last_alerts upsert），考虑批量写入或分区表
-3. **压测脚本化**：loadgen 已支持 `-rate/-duration/-concurrency/-variety`，可接入 CI 作为回归基准（失败率 >1% 即非零退出）
+2. **真实告警洪峰**（如 100+ 万/min）：瓶颈在逐事件管线串行（~50ms/事件 ≈ 4 次 DB 往返 + 业务逻辑）。方向：规则引擎规则缓存（当前每事件全量读规则表）、dedup/规则读合并、`SaveAlerts` 批量写（需批内去重 overlay，见上）
+3. **压测脚本化**：loadgen 已支持 `-rate/-duration/-concurrency/-variety/-batch`，可接入 CI 作为回归基准（失败率 >1% 即非零退出）
