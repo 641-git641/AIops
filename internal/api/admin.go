@@ -67,6 +67,8 @@ func (s *Server) handleCreateRule(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	// 规则变化立即失效租户缓存（下次 Evaluate 重新查库，无需等 TTL）
+	s.rules.Invalidate(tenantID(c))
 	c.JSON(http.StatusCreated, r)
 }
 

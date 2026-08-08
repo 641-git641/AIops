@@ -258,6 +258,7 @@ deploy/            docker-compose（PostgreSQL）
 - **Phase 2f**：工作流扩展 ✅（interval/manual 触发 + http step headers/认证 + 并发执行）、LLM 深化
 - **Phase 2g**：LLM 深化 ✅（聚类/摘要/RCA 增强全链路 LLM 可选 + 流式）
 - **Phase 3**：规模化 ✅（Postgres 加固：连接池/启动重试/索引/保留策略；拓扑影响面 SQL 递归 CTE；万级压测 **1786/s**（≈10.7 万/min）10 倍余量达标；Neo4j 后置仅替换 Impact 查询）
-- **Phase 3b（当前最新）**：写入优化 ✅（SaveAlert 单 SQL 双表写入——每事件往返 4→1，P50 61→51ms；alerts 按 created_at 月分区 + 保留策略整分区 DROP；loadgen `-batch` 批量扫描论证批量写降级；`AIOPS_ALERTSPARTITIONS` 默认 true）
+- **Phase 3b**：写入优化 ✅（SaveAlert 单 SQL 双表写入——每事件往返 4→1，P50 61→51ms；alerts 按 created_at 月分区 + 保留策略整分区 DROP；loadgen `-batch` 批量扫描论证批量写降级；`AIOPS_ALERTSPARTITIONS` 默认 true）
+- **Phase 3c（当前最新）**：规则引擎规则缓存 ✅（按租户缓存启用规则，TTL 内 0 次规则表读；`POST /rules` 即失效；P50 51→47.4ms、P99 88→80.7ms）
 
 详见 `docs/`：进度 [docs/PROGRESS.md](docs/PROGRESS.md)、压测基准 [docs/PERF.md](docs/PERF.md)。

@@ -24,10 +24,10 @@ func TestPartitionNameFor(t *testing.T) {
 
 func TestPartitionBounds(t *testing.T) {
 	cases := []struct {
-		y          int
-		m          time.Month
-		wantFrom   string
-		wantTo     string
+		y        int
+		m        time.Month
+		wantFrom string
+		wantTo   string
 	}{
 		{2026, 8, "2026-08-01 00:00:00+00", "2026-09-01 00:00:00+00"},
 		// 12 月跨年：边界进入次年 1 月

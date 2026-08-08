@@ -74,7 +74,7 @@ func main() {
 			dials.Add(1)
 			return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, addr)
 		},
-		MaxIdleConns:       100000,
+		MaxIdleConns:        100000,
 		MaxIdleConnsPerHost: 100000,
 		IdleConnTimeout:     90 * time.Second,
 	}

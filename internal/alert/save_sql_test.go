@@ -74,9 +74,9 @@ func TestBuildSaveSQLZeroTimeFilled(t *testing.T) {
 func TestBuildSaveSQLAnchors(t *testing.T) {
 	sql, _ := buildSaveSQL(sampleAlert())
 	for _, anchor := range []string{
-		"?::jsonb",           // JSON 显式 cast
+		"?::jsonb",                             // JSON 显式 cast
 		"ON CONFLICT (tenant_id, fingerprint)", // last_alerts 冲突仲裁
-		"RETURNING id",       // CTE 数据修改子句
+		"RETURNING id",                         // CTE 数据修改子句
 	} {
 		if !strings.Contains(sql, anchor) {
 			t.Errorf("SQL missing anchor %q\n---\n%s", anchor, sql)

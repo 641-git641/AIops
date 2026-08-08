@@ -102,8 +102,20 @@ bucket le=0.05   45079   le=0.1  70702   le=0.25  99644   le=0.5  110681
 - 兼容性：Phase 3 binary 写分区表正常（透明路由）；`AIOPS_ALERTSPARTITIONS=false` 降级为纯行级 DELETE（已分区表可用，**不提供反向迁移**）。
 - 踩坑记录：① AutoMigrate 先建索引于普通表，RENAME/DROP legacy 时被带走 → 迁移后需 `ensureAlertIndexes` 幂等补建（父表建 → PG 自动传播）；② default 分区已有数据时补建历史分区会报 `updated partition constraint ... would be violated`（PG 语义：先清数据再建分区）；③ GORM AutoMigrate 不建分区表，列 DDL 需手动逐列对齐真实表（varchar(n)/jsonb/timestamptz）。
 
+### D5：规则引擎规则缓存（Phase 3c）
+
+- 原逐事件管线 4 次 DB 往返（dedup 2 读 + **规则 1 读** + 写 1 次）；`RuleEngine` 按租户缓存启用规则（TTL 默认 5s，RWMutex + 锁外查库 + double-check，对齐 WindowFilter），`POST /rules` 后 `Invalidate` 立即失效。
+- 实测（2000rps/300 并发/30s/variety 200，同 Phase 3b 基线）：
+
+  | 版本 | P50 | P99 | 吞吐 | 失败率 |
+  |---|---|---|---|---|
+  | Phase 3b（无缓存） | 51ms | 88ms | 1790/s | 0.14% |
+  | **Phase 3c（规则缓存）** | **47.4ms** | **80.7ms** | **1795/s** | **0.026%** |
+
+  P50 -7%、P99 -8%，吞吐持平——剩余瓶颈是逐事件串行（dedup 2 读 + 写 1 次 + 业务逻辑），单次规则读已消除。规则表读在缓存命中时 TTL 内 0 次/事件。
+
 ## 建议（后续规模化）
 
 1. **Linux 部署**：回环连接问题仅 Windows 开发态出现；生产建议关闭 debug 模式 + 设置 `WriteTimeout`/`IdleTimeout`，连接池按实例规格调整
-2. **真实告警洪峰**（如 100+ 万/min）：瓶颈在逐事件管线串行（~50ms/事件 ≈ 4 次 DB 往返 + 业务逻辑）。方向：规则引擎规则缓存（当前每事件全量读规则表）、dedup/规则读合并、`SaveAlerts` 批量写（需批内去重 overlay，见上）
+2. **真实告警洪峰**（如 100+ 万/min）：瓶颈在逐事件管线串行（~50ms/事件 ≈ 3 次 DB 往返 + 业务逻辑，规则读已缓存）。方向：dedup 2 读合并、`SaveAlerts` 批量写（需批内去重 overlay，见上）、规则缓存 TTL 下调（`NewRuleEngine` 构造参数）
 3. **压测脚本化**：loadgen 已支持 `-rate/-duration/-concurrency/-variety/-batch`，可接入 CI 作为回归基准（失败率 >1% 即非零退出）

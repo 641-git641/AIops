@@ -73,7 +73,7 @@ func main() {
 		os.Exit(1)
 	}
 	svc := incident.NewService(db)
-	rules := incident.NewRuleEngine(db, celEngine, svc)
+	rules := incident.NewRuleEngine(db, celEngine, svc, 5*time.Second)
 	topoSvc := topology.NewService(db)
 	// Phase 3：归一化依赖边回填（存量 JSONB 依赖投影到 topology_edges，影响面查询的事实来源）
 	if err := topoSvc.SyncAllEdges(context.Background(), "default"); err != nil {

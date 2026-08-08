@@ -1,7 +1,7 @@
 # AIOps 告警平台 — 项目进度交接文档
 
 > 用途：跨会话/换窗口继续开发的现状快照。任何新窗口先读本文件 + README.md。
-> 最后更新：2026-08-07（工作流扩展完成：interval/manual 触发 + http step headers/auth + 并发执行，下一步 LLM 深化）
+> 最后更新：2026-08-08（Phase 3b 写入优化已提交 `61e7b18` 并重启 :8080 生效；Phase 3c 规则引擎规则缓存完成，P50 -7%/P99 -8%）
 
 ---
 
@@ -127,6 +127,15 @@ Alert → process_event ──┬── 确定性热路径（去重 → 入库 �
   - 配置：`AIOPS_ALERTSPARTITIONS`（默认 true；关闭退回纯行级 DELETE，已分区表降级可用；**不提供反向迁移**）。
 - **e2e**（独立实例 :8081）：① D1 功能——同 fingerprint 两事件 → 2 行 alerts + 1 行 last_alerts 指向最新，孤立 0；② 路由——6/29、7/4 行落 `alerts_default` 兜底分区；③ 保留清理——6 月分区 `retention: dropped partition alerts_p202606` + default 中 7/4 行 `cleaned rows=1`；④ 兼容——:8080 主实例（Phase 3 binary）写入分区表正常（落 8 月分区）；⑤ 压测对比与 batch 扫描见上。
 - **数据清理**：压测数据（alerts 11.6 万行 + 关联 ati/incidents/last_alerts）按名清理，DB 恢复 129 alerts / 123 last_alerts / 孤立 0；incidents 56 行（rule/agent/ai 真实数据）保留。
+
+### Phase 3c — 规则引擎规则缓存 ✅（当前最新）
+- **动机**：真实洪峰下逐事件管线 ~50ms/事件 ≈ 4 次 DB 往返（dedup 2 读 + **规则 1 读** + 写 1 次）——规则读原为每事件全量 `rules` 表查询。
+- **实现**（`internal/incident/rule_engine.go`）：`RuleEngine` 增加按租户的启用规则缓存（`ruleCache map[tenantID]ruleCacheEntry`），模式对齐 `WindowFilter`——RWMutex 快路径 + TTL（构造参数，默认 5s）+ **锁外查库 + double-check 回填**；`loadRules` 可注入（单测假 loader）、`now` 时钟注入。`Evaluate` 改走 `enabledRules`（TTL 内缓存命中 0 次 DB 读）。
+- **失效**：`POST /rules` 创建后 `s.rules.Invalidate(tenantID)` 立即失效（下次 Evaluate 重查库，无需等 TTL）；DB 外部改规则受 TTL 上限约束（有界陈旧，与 WindowFilter 一致）。API server 与 pipeline 共享同一 `RuleEngine` 实例，失效点对热路径即时生效。
+- **单测**（rule_engine_test.go，5 个）：TTL 内命中不重查 / TTL 过期重查 / Invalidate 强制重查且不影响他租户 / **loader 失败不污染缓存**（错误不写入缓存，恢复后正常）/ 并发访问安全（Windows 下 `-race` 工具链不可用，常规 -run 通过）。
+- **压测**（2000rps/300 并发/30s/variety 200，同 Phase 3b 基线）：**P50 51→47.4ms（-7%）、P99 88→80.7ms（-8%）**，吞吐 1795/s 持平（瓶颈仍在逐事件串行），失败率 0.026%。收益符合预期：规则读占 4 次往返的 1 次。
+- **e2e**：API 创建规则（critical + service=rcsmoke）→ 同条件告警 → 命中创建 `source=rule` incident（验证缓存命中路径 + Invalidate 后立即生效）；压测数据（alerts 4.2 万 + 8 个 loadgen AI 聚类 incident + 冒烟痕迹）按名清理，DB 恢复 129 alerts / 123 last_alerts / 2 rules / 56 incidents / 孤立 0。
+- **其余 lever**（尚未做）：dedup 2 读合并、`SaveAlerts` 批量写（需批内 overlay）、生产 HTTP 超时调优。
 
 ---
 
@@ -400,7 +409,8 @@ cd web && npm run build                                    # tsc + vite build �
 |---|---|---|
 | ~~**LLM 深化**~~（✅ 已交付，Phase 2g） | 聚类摘要也接 LLM（非确定性模板）；LLM 建议动作回填 Heal；流式/超时可控 | ai + agent + web |
 | ~~**规模化**~~（✅ 已交付，Phase 3） | Postgres 加固、拓扑影响面（SQL 递归 CTE）、万级压测（10 倍余量达标）；Neo4j 后置仅替换 Impact 查询 | 全局 |
-| **规模化延伸**（候选） | 真实洪峰写入优化（alerts 批量写入/分区表）、生产 HTTP 超时与连接池按规格调优、loadgen 接入 CI 回归基准 | 全局 |
+| ~~**规模化延伸**~~（✅ 已交付，Phase 3b/3c） | alerts 月分区 + 保留 DROP、CTE 单语句写入、规则引擎规则缓存；批量写（D2）扫描论证后降级 | 全局 |
+| **规模化下一步**（候选） | 生产 HTTP 超时（WriteTimeout/IdleTimeout）按规格调优、dedup 2 读合并、`SaveAlerts` 批量写（需批内 overlay）、loadgen 接入 CI 回归基准 | 全局 |
 
 基准报告见 **docs/PERF.md**（根因链/修复清单/服务端观测/建议）。
 

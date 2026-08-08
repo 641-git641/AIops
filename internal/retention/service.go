@@ -56,6 +56,7 @@ func (s *Service) RunOnce(ctx context.Context) error {
 //  1. DropPartitions 时先 DROP 整月已过期的分区（零 WAL、无锁表）；
 //  2. 随后行级 DELETE 兜底：当月分区跨 cutoff 的行（如 30d/8-8 时 7 月 1-9 日行）
 //     按「子查询取 id + 主表删除」分批删除，避免单条 DELETE 全表扫描加锁。
+//
 // 循环直到一批删不满（即过期行已清完）。
 func (s *Service) cleanTable(ctx context.Context, r Rule) error {
 	cutoff := time.Now().UTC().Add(-time.Duration(r.Days) * 24 * time.Hour)
