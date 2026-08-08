@@ -80,9 +80,9 @@ bucket le=0.05   45079   le=0.1  70702   le=0.25  99644   le=0.5  110681
 - 实测（2000rps/300 并发/30s，同 Phase 3 参数）：**P50 61→51ms（-17%）、P99 100→88ms（-12%）**，吞吐 1790/s 持平——单次写入往返已不再是瓶颈，剩余 ~50ms/事件为管线串行成本（dedup 2 读 + 规则 1 读 + 写 1 次 ≈ 4 次 DB 往返 + 业务逻辑）。
 - 注意：JSON 列必须 `string(datatypes.JSON)` + `?::jsonb` 绑定（直接传 []byte 会被 pgx 编成 bytea 报 cast 错误）；raw Exec 无 GORM 自动回填 CreatedAt/UpdatedAt，需 Go 侧回填。
 
-### D4：批量扫描结论（批量写 D2 降级依据）
+### D4：批量扫描 → SaveAlerts 批量写（D2 落地，Phase 3g）
 
-`loadgen -batch N`（-rate 恒为事件/秒；2000 事件/s、300 并发、variety 400）：
+`loadgen -batch N`（-rate 恒为事件/秒；2000 事件/s、300 并发、variety 400/200）原扫描结论——**请求延迟 ≈ batch × 50ms（每事件处理时间恒定）**，瓶颈是逐事件管线串行，不是语句本身：
 
 | batch | 请求延迟 P50 | 事件吞吐 | 失败率 |
 |---|---|---|---|
@@ -91,9 +91,20 @@ bucket le=0.05   45079   le=0.1  70702   le=0.25  99644   le=0.5  110681
 | 50 | 2072ms | 1317/s | 12% |
 | 100 | 3769ms | 1000/s | 31% |
 
-- **请求延迟 ≈ batch × 50ms（每事件处理时间恒定）** → 瓶颈是逐事件管线串行，不是语句本身。
-- 批量写（`SaveAlerts` 多行 insert）只优化 4 次往返中的写 1 次，且需要批内内存去重 overlay（同批同 fingerprint 事件 2 必须看到事件 1 的 last_alerts 状态）——**禁止裸延迟 flush**。本阶段不做，扩展点：`Repository.SaveAlerts(ctx, []*Alert, []DedupKind)` + Deduper overlay 注入位；待真实 Alertmanager 大批次 push 出现时立项。
 - batch 失败全为 `refused`（单请求时长 1s+ 占连接 → Windows 回环 accept 队列耗尽），非服务端故障（Linux 部署无此边缘行为）。
+
+**✅ Phase 3g 已落地**（`Repository.SaveAlerts(ctx, []*Alert, []DedupKind)` + `GetLastAlerts` + 批内 overlay `classifyBatchLast`）：
+- dedup 批量读 + 批量写合并为**每批 2 次 DB 往返**（1 读 + 1 写），业务副作用（规则/WS/Agent/工作流）仍逐事件。批量读失败自动回退逐事件；批量写失败逐条 `SaveAlert` 降级。
+- **禁止裸延迟 flush**：批内 overlay 模拟「前序事件已写」后的 last_alerts 状态，同批同 fingerprint 后序事件必须看到前序状态（等价逐事件读 DB）。
+- **关键正确性**：单语句多行 CTE 的 last_alerts `ON CONFLICT DO UPDATE` 若两行同键会触发 PG「cannot affect row a second time」→ last_alerts 在 Go 侧**折叠**（每 fingerprint 保留批内最后一条），alerts 仍写全部历史行。
+- 实测（loadgen `-batch 20`，2000 事件/s/300 并发/30s/variety 200）：
+
+  | 路径 | 请求 P50 | 失败率 | 事件吞吐 |
+  |---|---|---|---|
+  | Phase 3b 逐事件（扫描） | 973ms | 5% | 1621/s |
+  | **Phase 3g 批量写** | **197ms** | **0%** | **1774/s** |
+
+  **请求延迟 -80%（973→197ms）、失败率 5%→0%**，吞吐持平。批内 overlay 去重正确拦截同内容（duplicated 6981 / update 26561 / new 2461）。
 
 ### D3：alerts 月分区 + 保留策略 DROP PARTITION
 
@@ -131,7 +142,7 @@ bucket le=0.05   45079   le=0.1  70702   le=0.25  99644   le=0.5  110681
 ## 建议（后续规模化）
 
 1. **Linux 部署**：回环连接问题仅 Windows 开发态出现；连接池按实例规格调整。~~生产设置 `WriteTimeout`/`IdleTimeout`~~ **已落地（Phase 3e）**：全局 `ReadTimeout`（默认 15s）/`WriteTimeout`（30s）/`IdleTimeout`（120s），`ReadHeaderTimeout` 固定 5s 防 slowloris。**注意 WS 长连接**：coder/websocket hijack 后不清除 net/http 残留的读写 deadline，需在 WS handler（`hub.ServeWS`）Accept 前用 `http.NewResponseController` 显式清除（详见 PROGRESS.md Phase 3e）。gin debug 模式仍建议生产关闭。
-2. **真实告警洪峰**（如 100+ 万/min）：瓶颈在逐事件管线串行（~35ms/事件 ≈ 2 次 DB 往返 + 业务逻辑，dedup 与规则读均已缓存/单读）。方向：`SaveAlerts` 批量写（需批内去重 overlay，见上）、规则缓存 TTL 下调（`NewRuleEngine` 构造参数）、dedup 读并入写入语句（write-return-last-alert，进一步 2 往返 → 1 往返，但改动大需评估）
+2. **真实告警洪峰**（如 100+ 万/min）：瓶颈在逐事件管线串行（~35ms/事件 ≈ 2 次 DB 往返 + 业务逻辑，dedup 与规则读均已缓存/单读）。~~`SaveAlerts` 批量写~~ **已落地（Phase 3g）**：dedup 批量读 + 单语句批量写合并为每批 2 次往返（批内 overlay 去重，batch20 请求延迟 973→197ms）。剩余方向：规则缓存 TTL 下调（`NewRuleEngine` 构造参数）、dedup 读并入写入语句（write-return-last-alert，进一步 2 往返 → 1 往返，但改动大需评估）
 3. ~~**压测脚本化**~~ **已落地（Phase 3f）**：loadgen 新增 `-summary`（JSON 汇总留痕）与 `-compare`（基线对比回归判定：吞吐 <0.8× 或 P50/P99 >1.5× 基线非零退出，profile 须一致）+ 容差可调；Makefile 封装 `make bench` / `make regress` / `make regress-baseline`（`.bench/` 已 gitignore）。首次 `make regress-baseline` 记录当前环境基线（**同环境同轮次比较才有效**），之后 `make regress` 当回归看门狗
 
 ### 当前环境复测说明（2026-08-08 Phase 3e 期间）

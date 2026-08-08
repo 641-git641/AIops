@@ -262,6 +262,7 @@ deploy/            docker-compose（PostgreSQL）
 - **Phase 3c**：规则引擎规则缓存 ✅（按租户缓存启用规则，TTL 内 0 次规则表读；`POST /rules` 即失效；P50 51→47.4ms、P99 88→80.7ms）
 - **Phase 3d**：dedup 单读 ✅（`alert_hash` 冗余进 `last_alerts`，去重分类 2 读合并为 1 次唯一索引读，不再回读 alerts 分区表；启动幂等回填存量行；P50 47.4→33.1ms、P99 80.7→61.9ms——至此逐事件 DB 往返 4→2 次）
 - **Phase 3e**：生产 HTTP 超时调优 ✅（`ReadTimeout` 15s / `WriteTimeout` 30s / `IdleTimeout` 120s + `ReadHeaderTimeout` 5s 防 slowloris；WS 端点 Accept 前显式清除 net/http 残留 deadline 防长连接被误杀；`AIOPS_HTTP*TIMEOUTSEC` 可调）
-- **Phase 3f（当前最新）**：loadgen 接入 CI 回归基准 ✅（`-summary` JSON 汇总留痕 + `-compare` 基线对比判定：吞吐 <0.8× 或 P50/P99 >1.5× 基线非零退出、profile 须一致；Makefile `make bench` / `make regress` / `make regress-baseline`，本地无 remote 也能当回归看门狗）
+- **Phase 3f**：loadgen 接入 CI 回归基准 ✅（`-summary` JSON 汇总留痕 + `-compare` 基线对比判定：吞吐 <0.8× 或 P50/P99 >1.5× 基线非零退出、profile 须一致；Makefile `make bench` / `make regress` / `make regress-baseline`，本地无 remote 也能当回归看门狗）
+- **Phase 3g（当前最新）**：SaveAlerts 批量写 ✅（dedup 批量读 + 单语句多行 CTE 批量写合并为每批 2 次 DB 往返；批内 overlay 去重（禁裸延迟 flush）；last_alerts Go 侧折叠避免 PG「cannot affect row a second time」；批量读失败回退逐事件；`make bench-batch` / `make regress-batch` / `make regress-baseline-batch`——batch20 请求延迟 **973→197ms（-80%）**、失败率 5%→0%）
 
 详见 `docs/`：进度 [docs/PROGRESS.md](docs/PROGRESS.md)、压测基准 [docs/PERF.md](docs/PERF.md)。

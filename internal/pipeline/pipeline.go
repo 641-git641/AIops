@@ -5,6 +5,7 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -80,7 +81,18 @@ func (p *Pipeline) SetWorkflowTrigger(fn func(ctx context.Context, a *alert.Aler
 func (p *Pipeline) SetMetrics(m *metrics.Registry) { p.m = m }
 
 // ProcessEvents 批量处理入站事件（webhook 可能一次带多条）。
+// 批量快路径（Phase 3g）：批内去重 1 次批量读 + 1 次单语句批量写（SaveAlerts），
+// 业务副作用（规则/WS/Agent/工作流）逐事件执行；批量读失败自动降级逐事件路径。
 func (p *Pipeline) ProcessEvents(ctx context.Context, events []*alert.IngestEvent) []*ProcessResult {
+	if rs, ok := p.processEventsBatch(ctx, events); ok {
+		return rs
+	}
+	slog.Warn("pipeline: batch read failed, fallback to sequential processing")
+	return p.processEventsSequential(ctx, events)
+}
+
+// processEventsSequential 逐事件路径（Phase 3g 前语义；批量读失败降级用）。
+func (p *Pipeline) processEventsSequential(ctx context.Context, events []*alert.IngestEvent) []*ProcessResult {
 	results := make([]*ProcessResult, 0, len(events))
 	for _, e := range events {
 		if e == nil {
@@ -95,6 +107,141 @@ func (p *Pipeline) ProcessEvents(ctx context.Context, events []*alert.IngestEven
 	return results
 }
 
+// batchWriteChunk 批量写分块：每块 ≤ 100×15 + 100×9 = 2400 参数，远低于 PG 参数上限。
+const batchWriteChunk = 100
+
+// processEventsBatch 批量快路径：组装 → 批量读 → 批内 overlay 分类 → 批量写 → 逐条副作用。
+// 返回 (results, ok)；ok=false 仅当批量读失败（此时未写任何行，可安全降级逐事件）。
+func (p *Pipeline) processEventsBatch(ctx context.Context, events []*alert.IngestEvent) ([]*ProcessResult, bool) {
+	// Pass 1：组装（BuildAlert + 维护窗口 + 最终状态），纯内存
+	type cand struct {
+		a          *alert.Alert
+		suppressed bool
+		start      time.Time
+	}
+	var cands []cand
+	tenants := make(map[string][]int) // 租户 → 事件在 cands 中的下标
+	for _, e := range events {
+		if e == nil {
+			continue
+		}
+		if e.Provider == "" || e.Name == "" {
+			slog.Error("pipeline: process event", "provider", e.Provider, "name", e.Name, "err", errInvalidEvent)
+			continue
+		}
+		a := e.BuildAlert()
+		suppressed, err := p.maintenance.IsSuppressed(ctx, a)
+		if err != nil {
+			slog.Warn("pipeline: maintenance filter", "alert", a.ID, "err", err)
+			suppressed = false
+		}
+		if suppressed {
+			a.Status = alert.StatusSuppressed
+		}
+		idx := len(cands)
+		cands = append(cands, cand{a: a, suppressed: suppressed, start: time.Now()})
+		tenants[a.TenantID] = append(tenants[a.TenantID], idx)
+	}
+	if len(cands) == 0 {
+		return []*ProcessResult{}, true
+	}
+
+	// 批量读：逐租户一次读齐该批所有指纹的 last_alerts 状态（替代逐事件 GetLastAlert）
+	base := make(map[batchKey]*alert.LastAlert, len(cands))
+	for tenantID, idxs := range tenants {
+		fps := make([]string, 0, len(idxs))
+		seen := make(map[string]bool, len(idxs))
+		for _, i := range idxs {
+			fp := cands[i].a.Fingerprint
+			if !seen[fp] {
+				seen[fp] = true
+				fps = append(fps, fp)
+			}
+		}
+		rows, err := p.repo.GetLastAlerts(ctx, tenantID, fps)
+		if err != nil {
+			return nil, false
+		}
+		for fp, la := range rows {
+			base[batchKey{tenantID, fp}] = la
+		}
+	}
+
+	// 批内 overlay 分类（逐事件 kind；duplicate 立即广播，其余收集批量写）
+	cs := make([]batchCandidate, len(cands))
+	for i, c := range cands {
+		cs[i] = batchCandidate{
+			tenant:       c.a.TenantID,
+			fp:           c.a.Fingerprint,
+			alertHash:    c.a.AlertHash,
+			finalStatus:  c.a.Status,
+			windowActive: c.suppressed,
+		}
+	}
+	kinds := classifyBatchLast(base, cs)
+	resultsByIdx := make([]*ProcessResult, len(cands))
+	var toWrite []*alert.Alert
+	var writeKinds []alert.DedupKind
+	var writeSrc []int // 对应 cands 下标
+	for i, k := range kinds {
+		if k == alert.DedupDuplicate {
+			a := cands[i].a
+			if p.m != nil {
+				p.m.Inc("aiops_alerts_duplicated_total")
+			}
+			p.push.Broadcast(pusher.Event{Type: "alert.duplicate", TenantID: a.TenantID, Data: a.ToDTO()})
+			resultsByIdx[i] = &ProcessResult{Kind: k}
+			p.observeEvent(cands[i].start)
+		} else {
+			toWrite = append(toWrite, cands[i].a)
+			writeKinds = append(writeKinds, k)
+			writeSrc = append(writeSrc, i)
+		}
+	}
+
+	// 批量写（单语句多行 CTE，分块；块失败逐条降级——单语句原子，失败未写任何行）
+	for s := 0; s < len(toWrite); s += batchWriteChunk {
+		e := min(s+batchWriteChunk, len(toWrite))
+		chunk, chunkKinds, chunkSrc := toWrite[s:e], writeKinds[s:e], writeSrc[s:e]
+		if err := p.repo.SaveAlerts(ctx, chunk, chunkKinds); err != nil {
+			slog.Error("pipeline: batch save alerts", "n", len(chunk), "err", err)
+			for j := range chunk {
+				if err2 := p.repo.SaveAlert(ctx, chunk[j], chunkKinds[j]); err2 != nil {
+					slog.Error("pipeline: save alert (batch fallback)", "alert", chunk[j].ID, "err", err2)
+					p.observeEvent(cands[chunkSrc[j]].start)
+					continue // 写失败事件不 finalize（结果缺位，同逐事件 SaveAlert 失败）
+				}
+				resultsByIdx[chunkSrc[j]] = p.finalizeSaved(ctx, chunk[j], chunkKinds[j], cands[chunkSrc[j]].suppressed)
+				p.observeEvent(cands[chunkSrc[j]].start)
+			}
+			continue
+		}
+		for j := range chunk {
+			resultsByIdx[chunkSrc[j]] = p.finalizeSaved(ctx, chunk[j], chunkKinds[j], cands[chunkSrc[j]].suppressed)
+			p.observeEvent(cands[chunkSrc[j]].start)
+		}
+	}
+
+	// 按原事件顺序归集结果（写失败事件缺位，与逐事件错误语义一致）
+	results := make([]*ProcessResult, 0, len(cands))
+	for _, r := range resultsByIdx {
+		if r != nil {
+			results = append(results, r)
+		}
+	}
+	return results, true
+}
+
+// observeEvent 上报单事件处理耗时（批路径：Pass 1 起点 → 副作用完成；对齐 ProcessEvent 的 defer 采集）。
+func (p *Pipeline) observeEvent(start time.Time) {
+	if p.m != nil {
+		p.m.Observe("aiops_pipeline_duration_seconds", time.Since(start).Seconds())
+	}
+}
+
+// errInvalidEvent 非法入站事件（与 ProcessEvent 的校验错误同文案）。
+var errInvalidEvent = errors.New("pipeline: provider and name are required")
+
 // ProcessEvent 单条事件处理（同步）。
 func (p *Pipeline) ProcessEvent(ctx context.Context, e *alert.IngestEvent) (*ProcessResult, error) {
 	// 指标：处理耗时直方图（defer 采集，覆盖全部返回路径）
@@ -106,7 +253,7 @@ func (p *Pipeline) ProcessEvent(ctx context.Context, e *alert.IngestEvent) (*Pro
 		p.m.Observe("aiops_pipeline_duration_seconds", time.Since(start).Seconds())
 	}()
 	if e.Provider == "" || e.Name == "" {
-		return nil, fmt.Errorf("pipeline: provider and name are required")
+		return nil, errInvalidEvent
 	}
 	a := e.BuildAlert()
 
@@ -131,31 +278,34 @@ func (p *Pipeline) ProcessEvent(ctx context.Context, e *alert.IngestEvent) (*Pro
 		return &ProcessResult{Kind: kind}, nil
 	}
 
+	// 3. 入库（insert alerts + upsert last_alerts）+ 逐条副作用
 	if suppressed {
 		a.Status = alert.StatusSuppressed
-		if err := p.repo.SaveAlert(ctx, a, kind); err != nil {
-			return nil, fmt.Errorf("pipeline: save suppressed alert: %w", err)
-		}
+	}
+	if err := p.repo.SaveAlert(ctx, a, kind); err != nil {
+		return nil, fmt.Errorf("pipeline: save alert: %w", err)
+	}
+	return p.finalizeSaved(ctx, a, kind, suppressed), nil
+}
+
+// finalizeSaved 告警已入库后的逐条副作用（规则/WS/总线/Agent/工作流；单事件与批量路径共用）。
+func (p *Pipeline) finalizeSaved(ctx context.Context, a *alert.Alert, kind alert.DedupKind, suppressed bool) *ProcessResult {
+	if suppressed {
 		if p.m != nil {
 			p.m.Inc("aiops_alerts_suppressed_total")
 		}
 		p.push.Broadcast(pusher.Event{Type: "alert.suppressed", TenantID: a.TenantID, Data: a.ToDTO()})
 		p.publishEvent(ctx, "alert.suppressed", a, nil)
-		return &ProcessResult{Kind: kind, Suppressed: true}, nil
-	}
-
-	// 3. 入库（事务：insert alerts + upsert last_alerts）
-	if err := p.repo.SaveAlert(ctx, a, kind); err != nil {
-		return nil, fmt.Errorf("pipeline: save alert: %w", err)
+		return &ProcessResult{Kind: kind, Suppressed: true}
 	}
 	if p.m != nil {
 		p.m.Inc("aiops_alerts_total", string(kind))
 	}
 
-	// 4. 规则引擎关联（确定性热路径）
+	// 规则引擎关联（确定性热路径）
 	inc, _ := p.rules.Evaluate(ctx, a)
 
-	// 5. WS 广播
+	// WS 广播
 	eventType := "alert.new"
 	if kind == alert.DedupUpdate {
 		eventType = "alert.update"
@@ -165,20 +315,19 @@ func (p *Pipeline) ProcessEvent(ctx context.Context, e *alert.IngestEvent) (*Pro
 		p.push.Broadcast(pusher.Event{Type: "incident.upsert", TenantID: a.TenantID, Data: inc})
 	}
 
-	// 6. 事件总线（审计/扩散）
+	// 事件总线（审计/扩散）
 	p.publishEvent(ctx, eventType, a, inc)
 
-	// 7. Agent 路径触发：severity>=high 或规则配置 runAgent（可全局关闭）
+	// Agent 路径触发：severity>=high 或规则配置 runAgent（可全局关闭）
 	if p.AgentEnabled && shouldRunAgent(a, inc) {
 		p.triggerAgent(ctx, a, inc)
 	}
 
-	// 8. 工作流触发（keep 式：用户定义工作流监听告警事件；异步投递，由 workflow 引擎去重）
+	// 工作流触发（keep 式：用户定义工作流监听告警事件；异步投递，由 workflow 引擎去重）
 	if p.workflowTrigger != nil {
 		p.workflowTrigger(ctx, a)
 	}
-
-	return &ProcessResult{Kind: kind, Incident: inc}, nil
+	return &ProcessResult{Kind: kind, Incident: inc}
 }
 
 // shouldRunAgent 判定是否进入 Agent 智能路径。

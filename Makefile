@@ -1,6 +1,6 @@
 # AIOps 开发常用命令
 # 中间件（PostgreSQL）用 docker-compose 启动，应用本体 go run / npm run dev。
-.PHONY: infra app build test vet tidy web web-build clean bench regress regress-baseline
+.PHONY: infra app build test vet tidy web web-build clean bench regress regress-baseline bench-batch regress-batch regress-baseline-batch
 
 infra:
 	docker compose -f deploy/docker-compose.yml up -d postgres
@@ -50,3 +50,21 @@ regress:
 regress-baseline:
 	mkdir -p $(BENCH_DIR)
 	go run ./cmd/loadgen -baseurl $(LOADGEN_BASEURL) $(BENCH_FLAGS) -summary $(BENCH_DIR)/baseline.json
+
+# 批量路径回归（Phase 3g 服务端 SaveAlerts 批量写；同三目标语义，-batch 一次带多条）：
+#   make regress-baseline-batch → 用当前压测结果覆盖批量基线（换环境/改参数后需重记）
+#   make regress-batch          → 压测 + 对比批量基线
+# 可覆盖：BENCH_BATCH（单请求事件数）。
+BENCH_BATCH ?= 20
+
+bench-batch:
+	mkdir -p $(BENCH_DIR)
+	go run ./cmd/loadgen -baseurl $(LOADGEN_BASEURL) -rate 2000 -duration 30s -concurrency 300 -variety 200 -batch $(BENCH_BATCH) -summary $(BENCH_DIR)/latest-batch.json
+
+regress-batch:
+	mkdir -p $(BENCH_DIR)
+	go run ./cmd/loadgen -baseurl $(LOADGEN_BASEURL) -rate 2000 -duration 30s -concurrency 300 -variety 200 -batch $(BENCH_BATCH) -summary $(BENCH_DIR)/latest-batch.json -compare $(BENCH_DIR)/baseline-batch.json
+
+regress-baseline-batch:
+	mkdir -p $(BENCH_DIR)
+	go run ./cmd/loadgen -baseurl $(LOADGEN_BASEURL) -rate 2000 -duration 30s -concurrency 300 -variety 200 -batch $(BENCH_BATCH) -summary $(BENCH_DIR)/baseline-batch.json

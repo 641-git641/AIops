@@ -41,6 +41,61 @@ func TestClassifyLastAlert(t *testing.T) {
 	}
 }
 
+// ---------- classifyBatchLast（批内 overlay 去重，Phase 3g） ----------
+
+func TestClassifyBatchLast(t *testing.T) {
+	// 存量 + 批内 overlay 混合：批内同 fingerprint 后序事件必须看到前序写入意图
+	base := map[batchKey]*alert.LastAlert{
+		{tenantID: "t1", fingerprint: "fp1"}: {AlertHash: "h1", Status: alert.StatusFiring},
+	}
+	cs := []batchCandidate{
+		{tenant: "t1", fp: "fp1", alertHash: "h1", finalStatus: alert.StatusFiring}, // 存量 firing 同内容 → duplicate
+		{tenant: "t1", fp: "fp1", alertHash: "h2", finalStatus: alert.StatusFiring}, // 内容变化 → update
+		{tenant: "t1", fp: "fp2", alertHash: "h1", finalStatus: alert.StatusFiring}, // 无存量 → new
+		{tenant: "t1", fp: "fp1", alertHash: "h2", finalStatus: alert.StatusFiring}, // 批内第 4 条同内容 → duplicate
+	}
+	kinds := classifyBatchLast(base, cs)
+	want := []alert.DedupKind{alert.DedupDuplicate, alert.DedupUpdate, alert.DedupNew, alert.DedupDuplicate}
+	for i, k := range kinds {
+		if k != want[i] {
+			t.Errorf("kinds[%d] = %q, want %q", i, k, want[i])
+		}
+	}
+}
+
+func TestClassifyBatchLastOverlayVisible(t *testing.T) {
+	// 无存量：批内首条 new，后序同内容事件看到前序写入意图 → duplicate（禁止裸延迟 flush）
+	kinds := classifyBatchLast(nil, []batchCandidate{
+		{tenant: "t1", fp: "fp1", alertHash: "h1", finalStatus: alert.StatusFiring},
+		{tenant: "t1", fp: "fp1", alertHash: "h1", finalStatus: alert.StatusFiring},
+	})
+	want := []alert.DedupKind{alert.DedupNew, alert.DedupDuplicate}
+	for i, k := range kinds {
+		if k != want[i] {
+			t.Errorf("kinds[%d] = %q, want %q", i, k, want[i])
+		}
+	}
+}
+
+func TestClassifyBatchLastSuppressedOverlay(t *testing.T) {
+	// 维护窗口内 suppressed 同内容 = duplicate；窗口失效后 = update（过期状态上浮）
+	base := map[batchKey]*alert.LastAlert{
+		{tenantID: "t1", fingerprint: "fp1"}: {AlertHash: "h1", Status: alert.StatusSuppressed},
+	}
+	cs := []batchCandidate{
+		{tenant: "t1", fp: "fp1", alertHash: "h1", finalStatus: alert.StatusSuppressed, windowActive: true},
+		{tenant: "t1", fp: "fp2", alertHash: "h1", finalStatus: alert.StatusSuppressed, windowActive: true},
+		{tenant: "t1", fp: "fp2", alertHash: "h1", finalStatus: alert.StatusSuppressed, windowActive: false},
+	}
+	kinds := classifyBatchLast(base, cs)
+	want := []alert.DedupKind{alert.DedupDuplicate, alert.DedupNew, alert.DedupUpdate}
+	for i, k := range kinds {
+		if k != want[i] {
+			t.Errorf("kinds[%d] = %q, want %q", i, k, want[i])
+		}
+	}
+}
+
 func TestClassifyLastAlertResolvedRecurrence(t *testing.T) {
 	// 回归：已恢复告警同内容复发必须重新触发（旧逻辑靠 alerts 行 status，新逻辑靠 last_alerts）
 	la := &alert.LastAlert{AlertHash: "h1", Status: alert.StatusResolved}

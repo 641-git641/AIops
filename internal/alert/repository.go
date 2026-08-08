@@ -35,6 +35,42 @@ func (r *Repository) SaveAlert(ctx context.Context, a *Alert, kind DedupKind) er
 	return r.db.WithContext(ctx).Exec(sql, args...).Error
 }
 
+// SaveAlerts 批量写入 alerts 并 upsert last_alerts（D2 批量写落地，Phase 3g）：
+// 单语句多行 CTE（alerts 全量 insert + last_alerts 折叠 upsert），一次 DB 往返。
+// kinds 与 alerts 一一对应：new/update 写入，duplicate 跳过（对齐 SaveAlert）。
+// 语义与逐条 SaveAlert 一致：alerts 历史行全量保留；last_alerts 每 fingerprint
+// 只保留批内最后一条（折叠在 buildSaveAlertsSQL 内——单语句 ON CONFLICT 同 key
+// 会触发 PG「cannot affect row a second time」）。
+func (r *Repository) SaveAlerts(ctx context.Context, alerts []*Alert, kinds []DedupKind) error {
+	if len(alerts) == 0 {
+		return nil
+	}
+	sql, args := buildSaveAlertsSQL(alerts, kinds)
+	if len(args) == 0 {
+		return nil // 全部 duplicate：无事可写
+	}
+	return r.db.WithContext(ctx).Exec(sql, args...).Error
+}
+
+// GetLastAlerts 批量读取 last_alerts 当前状态（批内去重单读，Phase 3g）：
+// 一次查询读齐一批所有 fingerprint，返回按 fingerprint 索引的 map。
+func (r *Repository) GetLastAlerts(ctx context.Context, tenantID string, fingerprints []string) (map[string]*LastAlert, error) {
+	out := make(map[string]*LastAlert, len(fingerprints))
+	if len(fingerprints) == 0 {
+		return out, nil
+	}
+	var rows []LastAlert
+	if err := r.db.WithContext(ctx).
+		Where("tenant_id = ? AND fingerprint IN ?", tenantID, fingerprints).
+		Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	for i := range rows {
+		out[rows[i].Fingerprint] = &rows[i]
+	}
+	return out, nil
+}
+
 // UpsertLastAlert 单独刷新状态缓存（如规则引擎、确认操作时）。
 func (r *Repository) UpsertLastAlert(ctx context.Context, a *Alert) error {
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {

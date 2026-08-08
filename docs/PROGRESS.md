@@ -1,7 +1,7 @@
 # AIOps 告警平台 — 项目进度交接文档
 
 > 用途：跨会话/换窗口继续开发的现状快照。任何新窗口先读本文件 + README.md。
-> 最后更新：2026-08-08（Phase 3d dedup 单读完成 P50 -30%/P99 -23%；Phase 3e 生产 HTTP 超时调优完成；Phase 3f loadgen 接入 CI 回归基准完成）
+> 最后更新：2026-08-08（Phase 3d dedup 单读 P50 -30%/P99 -23%；Phase 3e HTTP 超时调优；Phase 3f loadgen CI 回归基准；Phase 3g SaveAlerts 批量写完成——batch 20 请求延迟 973→197ms）
 
 ---
 
@@ -176,6 +176,29 @@ Alert → process_event ──┬── 确定性热路径（去重 → 入库 �
 - **单测**（main_test.go，5 个）：同指标无回归 / 吞吐退化 / 延迟退化 / profile 不一致 / 基线缺失——`go test ./cmd/loadgen` 锁定回归判定逻辑。
 - **e2e 验证**（对运行中 :8080 小压测 100/s×2s×4 并发）：自身对比 PASS（ratio≈1.0）；伪造三份基线（吞吐×10 / 延迟×0.5 / rate 不同）→ 分别命中**吞吐回归 / p50+p99 延迟回归 / profile 不一致**，均非零退出；同路径脚枪有警告不静默。压测数据按名清理，DB 恢复 129 alerts / 123 last_alerts / 56 incidents / 孤立 0。
 
+### Phase 3g — SaveAlerts 批量写（批内 overlay 去重，D2 落地）✅（当前最新）
+- **动机**（docs/PERF.md D2 扩展点落地）：逐事件管线每事件 2 次 DB 往返（dedup 1 读 + 写 1 次）；loadgen `-batch N` 一次 POST 带 N 条事件，服务端仍逐条 `ProcessEvent` 串行 → 请求延迟 ≈ batch×50ms（D4 实测 batch20≈973ms）。本阶段把 **dedup 批量读 + 批量写**合并为每批 2 次往返（1 读 + 1 写），业务副作用（规则/WS/Agent/工作流）仍逐事件执行。
+- **批量写**（`internal/alert/save_sql.go` + `repository.SaveAlerts` + `GetLastAlerts`）：
+  - `buildSaveAlertsSQL` 双 CTE 单语句：`WITH ins AS (INSERT alerts ... RETURNING id), ups AS (INSERT last_alerts ... ON CONFLICT (tenant_id, fingerprint) DO UPDATE) SELECT 1`——alerts 历史全量多行 + last_alerts 折叠行，**1 次 DB 往返**，单语句原子。
+  - **关键正确性（必须记住）**：单语句多行 `ON CONFLICT DO UPDATE` 若两行同 `(tenant_id, fingerprint)` 会触发 PG「cannot affect row a second time」→ last_alerts 必须在 **Go 侧折叠**（每 fingerprint 保留批内最后一条的最终状态），alerts 仍写全部历史行。折叠用 `lastIdx` map + `sort.Ints` 保证 VALUES 与 args 顺序确定。
+  - duplicate 事件在构造 SQL 前过滤（对齐 `SaveAlert` 语义，防御）。
+- **批内 overlay 去重**（`internal/pipeline/dedup.go` + `classifyBatchLast`）：基于 DB 批量读到的存量 `base` + 批内 overlay（前序事件的写入意图）逐条分类——同批同 fingerprint 的后序事件必须看到前序事件写入后的 last_alerts 状态，**禁止裸延迟 flush**（PERF.md D2 决策）。非 duplicate 事件更新 overlay，与逐事件 `Classify` 读 DB 语义一致。纯函数无 DB，可单测。
+- **批量读**（`GetLastAlerts`）：逐租户一次 `WHERE tenant_id = ? AND fingerprint IN ?` 读齐该批全部指纹的 last_alerts 状态，替代逐事件 `GetLastAlert`。
+- **降级链**（`pipeline.go`）：批量读失败 → `ok=false` → 回退 `processEventsSequential`（原逐事件循环，此时未写任何行，安全）；批量写失败（单语句原子，未写任何行）→ 该块逐条 `SaveAlert` 降级，单条失败不 finalize（结果缺位，同逐事件错误语义）。
+- **分块**：`batchWriteChunk = 100`（每块 ≤ 100×15 + 100×9 = 2400 参数，远低于 PG 65535 上限）。
+- **统一副作用**：`ProcessEvent` 与批路径共用抽取的 `finalizeSaved`（suppressed → inc suppressed 指标 + 广播 alert.suppressed + publishEvent；normal → inc alerts_total + `rules.Evaluate` + 广播 alert.new/update + incident.upsert + publishEvent + shouldRunAgent → triggerAgent + workflowTrigger）。
+- **单测**：`TestBuildSaveAlertsSQL*` 6 个（占位符==args / JSON 为 string / 零时间回填 / **折叠正确性**——同批同 fp 2 条 → alerts 2 行 + last_alerts 折叠 1 行指向批内最后一条 / duplicate 过滤 / 全 duplicate 空）+ `TestClassifyBatchLast*` 3 个（base+overlay 混合 / **overlay 可见性**——无存量批内两条同内容 → new/duplicate / suppressed overlay 窗口语义）。
+- **压测**（loadgen `-batch 20`，2000 事件/s/300 并发/30s/variety 200，对运行中 :8080）：
+
+  | 路径 | 请求 P50 | 失败率 | 事件吞吐 |
+  |---|---|---|---|
+  | Phase 3b 逐事件（D4 扫描） | 973ms | 5% | 1621/s |
+  | **Phase 3g 批量写** | **197ms** | **0%** | **1774/s** |
+
+  **请求延迟 -80%（973→197ms）、失败率 5%→0%**，吞吐持平——瓶颈从「N 事件 × 2 次串行往返」降到「每批 2 次往返 + 逐条副作用」。指标：new 2461 / update 26561 / duplicated 6981（批内 overlay 去重正确拦截同内容）。
+- **Makefile**：仿三目标加 `-batch` 版本（`bench-batch` / `regress-batch` / `regress-baseline-batch`，`BENCH_BATCH ?= 20`，输出 `.bench/*-batch.json`）。
+- **e2e 批内三态**：一个 POST 带 3 条同 fingerprint 事件（内容 A / 重复 A / 内容 B，`instance` label 区分）→ accepted 3、processed 3、alerts **+2**（duplicate 跳过）、last_alerts 折叠指向内容 B；无孤立 incident。压测数据按名清理，DB 恢复 129 alerts / 123 last_alerts / 56 incidents / 孤立 0。
+
 ---
 
 ### Phase 3 — 规模化（Postgres 加固 + 万级压测 + 拓扑影响面）✅
@@ -310,7 +333,7 @@ dry-run（`AIOPS_AGENTDRYRUN=true` 默认）→ 爆炸半径 >`AIOPS_AGENTBLASTR
 | 组件 | 状态 | 备注 |
 |---|---|---|
 | PostgreSQL | docker 容器（compose） | `deploy/docker-compose.yml`，DSN `host=127.0.0.1 user=aiops password=aiops dbname=aiops port=5432` |
-| 后端 | :8080 运行中（PID 20548，Phase 3e binary） | 启动命令含 `AIOPS_NOTIFIERCHANNELS=http AIOPS_NOTIFIERHTTP=http://localhost:9999/webhook AIOPS_NOTIFIERBASEURL=http://localhost:5173 ./bin/aiops.exe`；HTTP 超时默认 Read 15s / Write 30s / Idle 120s |
+| 后端 | :8080 运行中（PID 14100，Phase 3g binary） | 启动命令含 `AIOPS_NOTIFIERCHANNELS=http AIOPS_NOTIFIERHTTP=http://localhost:9999/webhook AIOPS_NOTIFIERBASEURL=http://localhost:5173 ./bin/aiops.exe`；HTTP 超时默认 Read 15s / Write 30s / Idle 120s |
 | mock webhook | :9999 运行中（PID 28620） | `node deploy/mock_webhook.mjs 9999`，收到的通知打印到 stdout |
 | 前端 | Vite dev :5173 | `cd web && npm run dev` |
 
@@ -409,6 +432,12 @@ make bench            # 压测留痕 .bench/latest.json（不判定）
 make regress-baseline # 用当前环境结果记录 .bench/baseline.json（换环境/改参数后重记）
 make regress          # 压测 + 与基线对比：吞吐 <0.8× 或 P50/P99 >1.5× 基线 → 非零退出
 make regress BENCH_FLAGS="-rate 1000 -duration 10s"   # 覆盖压测参数（须与基线 profile 一致）
+
+# ⑭ 批量路径回归（Phase 3g SaveAlerts 批量写，同上三目标语义，-batch 一次带多条）
+make bench-batch            # 压测留痕 .bench/latest-batch.json（不判定）
+make regress-baseline-batch # 用当前环境结果记录 .bench/baseline-batch.json（换环境/改参数后重记）
+make regress-batch          # 压测 + 对比批量基线（吞吐 <0.8× 或 P50/P99 >1.5× → 非零退出）
+make regress-batch BENCH_BATCH=50    # 覆盖 batch（默认 20；须与基线 profile 一致）
 ```
 
 ### e2e 实测结果（已通过，2026-08-07）
@@ -444,7 +473,7 @@ go test ./...                                              # 全包通过（含 
 cd web && npm run build                                    # tsc + vite build 通过
 ```
 
-单测覆盖：notifier（逐渠道 JSON 抓包断言/聚合/失败/跳过/URL 拼接/脱敏 + lifecycle 消息 created/resolved/LifecycleNotifier 发送且 audit=nil 不 panic/Reload 重建渠道含停用空 webhook 未知名忽略/BuildChannel 合法与非法/Supported）、circuit（4）、agent heal/change、ai/cluster（5：分组/gap 断开/键稳定/新增名换键/unknown 服务 + Summarize）、ai/llm（客户端默认值/chatURL 拼接/输出解析含围栏与缺 rootCause/EnhanceRCA 抓包断言请求与解析/401 错误/无 key 不带 Authorization/**EnhanceCluster 抓包断言 + parseClusterOutput 围栏与缺 summary/CompleteStream 流式累计逐 delta/流式中途超时/EnhanceRCA 流式分发与请求体 stream=true/非流式超时/SetTimeout 非正数忽略断言 http.Client.Timeout**）、agent/rca（无 LLM 不产生 llm* 字段/enhance 叠加与输入组装/fail-open 不写 llm* 字段/nil 输出忽略）、agent/heal（+**suggestedActions 合并 llm 建议去重顺序/非字符串忽略/Heal 回填 LLM 建议被 Resolve 收到**）、config（LLM 默认值与 env 命名：AIOPS_LLMAPIKEY/AIOPS_LLMTIMEOUTSEC/AIOPS_LLMSTREAM 生效 + 工作流扩展默认值 + **Phase 3 存储加固：连接池/重试/保留策略默认值与 env 命名（AIOPS_DBMAXOPENCONNS/AIOPS_DBCONNECTRETRIES/AIOPS_RETENTIONENABLED 等）**）、metrics（**Prometheus 文本输出精确行 + 直方图 +Inf 桶 + 未注册指标静默**）、workflow（Parse 校验/触发匹配 severity 范围+service+name/provider/无 filters/DedupKey 稳定/runSteps 顺序+fail-fast/renderTemplate + interval/manual 类型校验/Interval() 解析/httpStep method+headers+bearer 抓包断言/basic auth/renderTemplate nil alert/agentStep nil alert 报错）、loadgen（5：compare 同指标无回归/吞吐退化/延迟退化/profile 不一致/基线缺失）、alert、cel、incident、pipeline、util。
+单测覆盖：notifier（逐渠道 JSON 抓包断言/聚合/失败/跳过/URL 拼接/脱敏 + lifecycle 消息 created/resolved/LifecycleNotifier 发送且 audit=nil 不 panic/Reload 重建渠道含停用空 webhook 未知名忽略/BuildChannel 合法与非法/Supported）、circuit（4）、agent heal/change、ai/cluster（5：分组/gap 断开/键稳定/新增名换键/unknown 服务 + Summarize）、ai/llm（客户端默认值/chatURL 拼接/输出解析含围栏与缺 rootCause/EnhanceRCA 抓包断言请求与解析/401 错误/无 key 不带 Authorization/**EnhanceCluster 抓包断言 + parseClusterOutput 围栏与缺 summary/CompleteStream 流式累计逐 delta/流式中途超时/EnhanceRCA 流式分发与请求体 stream=true/非流式超时/SetTimeout 非正数忽略断言 http.Client.Timeout**）、agent/rca（无 LLM 不产生 llm* 字段/enhance 叠加与输入组装/fail-open 不写 llm* 字段/nil 输出忽略）、agent/heal（+**suggestedActions 合并 llm 建议去重顺序/非字符串忽略/Heal 回填 LLM 建议被 Resolve 收到**）、config（LLM 默认值与 env 命名：AIOPS_LLMAPIKEY/AIOPS_LLMTIMEOUTSEC/AIOPS_LLMSTREAM 生效 + 工作流扩展默认值 + **Phase 3 存储加固：连接池/重试/保留策略默认值与 env 命名（AIOPS_DBMAXOPENCONNS/AIOPS_DBCONNECTRETRIES/AIOPS_RETENTIONENABLED 等）**）、metrics（**Prometheus 文本输出精确行 + 直方图 +Inf 桶 + 未注册指标静默**）、workflow（Parse 校验/触发匹配 severity 范围+service+name/provider/无 filters/DedupKey 稳定/runSteps 顺序+fail-fast/renderTemplate + interval/manual 类型校验/Interval() 解析/httpStep method+headers+bearer 抓包断言/basic auth/renderTemplate nil alert/agentStep nil alert 报错）、loadgen（5：compare 同指标无回归/吞吐退化/延迟退化/profile 不一致/基线缺失）、**alert/save_sql（单事件 + Phase 3g 批量：buildSaveAlertsSQL 占位符==args/JSON 为 string/零时间回填/同批同 fp 折叠指向批内最后一条/duplicate 过滤/全 duplicate 空）**、**pipeline/dedup（classifyLastAlert 全分支 + Classify 单读断言 + Phase 3g classifyBatchLast：base+overlay 混合/overlay 可见性——无存量批内两条同内容 new→duplicate/suppressed overlay 窗口语义 + resolved 复发）**、alert、cel、incident、pipeline、util。
 
 ---
 
@@ -455,7 +484,7 @@ cd web && npm run build                                    # tsc + vite build �
 | ~~**LLM 深化**~~（✅ 已交付，Phase 2g） | 聚类摘要也接 LLM（非确定性模板）；LLM 建议动作回填 Heal；流式/超时可控 | ai + agent + web |
 | ~~**规模化**~~（✅ 已交付，Phase 3） | Postgres 加固、拓扑影响面（SQL 递归 CTE）、万级压测（10 倍余量达标）；Neo4j 后置仅替换 Impact 查询 | 全局 |
 | ~~**规模化延伸**~~（✅ 已交付，Phase 3b/3c/3d） | alerts 月分区 + 保留 DROP、CTE 单语句写入、规则引擎规则缓存、dedup 2 读合并（last_alerts 冗余 alert_hash）；批量写（D2）扫描论证后降级 | 全局 |
-| **规模化下一步**（候选） | ~~生产 HTTP 超时按规格调优~~（✅ Phase 3e）~~loadgen 接入 CI 回归基准~~（✅ Phase 3f，`make bench/regress/regress-baseline`）；`SaveAlerts` 批量写（需批内 overlay，待真实 Alertmanager 大批次 push） | 全局 |
+| **规模化下一步**（候选） | ~~生产 HTTP 超时按规格调优~~（✅ Phase 3e）~~loadgen 接入 CI 回归基准~~（✅ Phase 3f，`make bench/regress/regress-baseline`）~~`SaveAlerts` 批量写（批内 overlay）~~（✅ Phase 3g，`make bench-batch/regress-batch/regress-baseline-batch`，batch20 请求延迟 973→197ms） | 全局 |
 
 基准报告见 **docs/PERF.md**（根因链/修复清单/服务端观测/建议）。
 
