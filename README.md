@@ -33,6 +33,75 @@ make web              # cd web && npm run dev
 
 打开 http://localhost:5173（告警 / Incidents 页面）。
 
+## 数据安全与访问保护（KEEPON M1）
+
+**访问保护（可选，默认 noauth）**：设置 `AIOPS_AUTHTYPE=apikey` 并重启后端：
+
+1. 首次启动时控制台打印 **owner key（仅显示一次）**——前端自动进入解锁页，粘贴后凭据仅存于浏览器会话（`sessionStorage`）。
+2. REST 统一携带 `X-API-Key`；WebSocket 用短期 ticket 握手（密钥不进 URL）。
+3. 「设置 → 访问密钥」可新建/撤销密钥、重新生成 owner key；`/webhook` 等外部接入同样带 `X-API-Key`。
+4. 密钥丢失：清空 `api_keys` 表后重启会自动生成新 owner key（幂等引导）。
+
+**日志持久化**：设置 `AIOPS_LOGFILE=./logs/aiops.log` 后 stdout 与文件双写，按大小/数量/天数轮转（默认 ≈1GB 上限）；全局脱敏（apiKey/密钥/token/URL 查询参数 → `[REDACTED]`），请求 ID 贯穿 HTTP 访问日志。
+
+**数据备份**：设置 `AIOPS_BACKUPENABLED=true` 后每 24h 自动 `pg_dump -Fc`（启动补跑、数量+容量双限轮转、默认备份后恢复校验）。「设置 → 数据备份」可查看记录/手动触发；恢复仅通过 `bash scripts/restore.sh`（演练 `--verify` / 真实恢复 `--target`，二次确认），详见 `docs/RESTORE.md`。
+
+## 总览大屏与一条命令接入（KEEPON M2）
+
+**总览与平板大屏**：打开即进入「总览」首页——活跃告警/事故/执行中任务/知识条目卡片、24h 告警趋势、严重度分布、最近事件（刷新后仍在，数据来自 DB 重查）、系统健康与最近备份。访问 **`http://localhost:5173/wallboard`** 进入暗色大字只读大屏（30s 自动刷新，适合挂墙/平板常驻）。
+
+**一条命令接入告警**（个人脚本/任意监控系统）：总览或告警页空状态有可复制 curl（自动带平台地址与认证头）+「发送测试告警」按钮：
+
+```bash
+curl -X POST http://localhost:8080/api/v1/webhook/generic \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"磁盘使用率过高","severity":"warning","status":"firing",
+       "source":"my-script","dedupKey":"node-1-root-disk",
+       "labels":{"host":"node-1","disk":"/"},"description":"当前 92%"}'
+```
+
+- `severity` 支持别名（p0/severe/error/warning/warn/notice），`status` 为 `firing|resolved`（恢复时发 `resolved` 即自动复位）。
+- `dedupKey` 可选：同 `dedupKey` 的重复告警走更新而非新增；`description` 含变化内容（如"当前 92%"）不影响去重。
+- 响应回显归一化 severity 与指纹，便于调试。
+
+**通知节流**（默认开启，无需配置）：同一告警首条立即通知，冷却期内重复合并为周期汇总（"过去 30 分钟重复 47 次"），严重度升级与恢复立即通知；决策全部落审计（`notify.sent/throttled/summary`，可解释为何发送/被节流）。
+
+## 结案即知识（KEEPON M3）
+
+**结案发布**：事故详情页「结案并发布到知识库」——表单自动带出故障现象/关联告警/RCA 根因（确定性证据与 LLM 推测明确标注来源）；保存后结案数据立即进入知识索引（verified+success → **T3**），下方三态展示：`事故已解决 / 结案已填写 / 知识已索引`（索引中 3s 自动刷新，失败显示原因，`rejected` 结案退出召回）。
+
+**个人知识源（runbook/SOP）**：「知识库 → 知识源」拖拽上传 .md——支持 front matter（title/service/tags/updated_at）、发布前预览解析与脱敏检查（敏感串自动标出、提示注入警告）、发布即入索引（**T2**）、编辑生成新版本（旧版 superseded 保留）、删除同步撤销文档与向量；检索结果被标记 unsafe 后自动隔离，重新发布新版本即恢复。
+
+**检索评测（golden set）**：「知识库 → 评测集」维护个人真实查询（每条标注期望命中的事故/runbook），运行：
+
+```bash
+go run ./cmd/rag-eval -topk-final 6 -json .bench/eval1.json          # 基线
+go run ./cmd/rag-eval -topk-final 10 -json .bench/eval2.json -baseline .bench/eval1.json  # 调参对比
+```
+
+输出 Recall@K（候选/选中双口径）、首条命中率、空结果率、延迟与降级分布；`-fail-on-regression` 可接 CI。
+
+## 数据接入（Prometheus / Grafana / 大模型 API）
+
+**Prometheus / Alertmanager（webhook 推送）**：Alertmanager 配置 receivers 指向本平台即可：
+
+```yaml
+# alertmanager.yml
+route:
+  receiver: aiops
+receivers:
+  - name: aiops
+    webhook_configs:
+      - url: http://<aiops-host>:8080/api/v1/webhook/prometheus
+        send_resolved: true
+```
+
+验证：`curl -X POST localhost:8080/api/v1/webhook/prometheus -d '{...Alertmanager 格式...}'` → `{accepted, processed}`；或发一条真实告警后 `GET /api/v1/alerts` 可见。
+
+**Grafana Alerting（webhook 推送）**：Grafana → Alerting → Contact points → 新建 webhook 类型联系人，URL 填 `http://<aiops-host>:8080/api/v1/webhook/grafana`，通知策略引用该联系人。Grafana Unified Alerting 负载自动归一化（labels/annotations/generatorURL/values 入告警详情）。验证：`curl -X POST localhost:8080/api/v1/webhook/grafana -d '{...Grafana webhook 格式...}'`。
+
+**大模型 API 接入**：Chat LLM（RCA 根因补充/聚类摘要）走前端「模型配置」页（或 `model_configs` 表），env 的 `AIOPS_LLM*` 仅首启种子，之后 DB 为准。Embedding（RAG 向量化）**无配置入口**——由 `AIOPS_EMBEDDING*` 环境变量直接配置（千问示例见配置表）。均**保存/修改后重启后端生效**；管理端点需 `AIOPS_MODELCFGADMINAPIS=true`（见配置表）。
+
 ## 端到端验收（已通过）
 
 ```bash
@@ -234,6 +303,8 @@ internal/
   notifier/         通知渠道（钉钉/飞书/企微/HTTP webhook + 审计联动）+ 生命周期通知（lifecycle.go）+ 渠道配置 DB 化（config_service.go，热重载）
   maintenance/      维护窗口（热路径静默：Window CRUD + 匹配 + WindowFilter 缓存）
   ai/               AI 聚类/摘要（确定性 cluster/summarize/service + 定时 worker）+ OpenAI 兼容 LLM 客户端（llm.go，RCA 增强）
+  embedding/        RAG 向量化 Provider（openai-compat /embeddings 客户端 + mock，独立于 Chat LLM）
+  rag/              知识检索层：知识表模型 + 显式 schema（pgvector/pg_trgm）+ 持久化索引 worker（SKIP LOCKED/退避/死信/回填/对账）+ 混合召回（精确/关键词/向量）+ RRF 融合 + 相似事故证据包
   workflow/         YAML 工作流引擎（def/match/service + workflow_runs 并发防重 + interval 调度器 + 异步有界执行）
   provider/         数据源抽象 + 注册表（prometheus 等）
   topology/         服务拓扑（RCA 事实来源）
@@ -285,11 +356,12 @@ curl -X POST localhost:8080/api/v1/maintenance-windows -H 'Content-Type: applica
 
 ## API 端点一览
 
-全部业务端点挂在 `/api/v1` 下（`authMiddleware` 注入租户；`noauth` 模式固定 `default` 租户，`apikey` 模式校验 `X-API-Key`）。`GET /healthz` 与 `GET /metrics` 不挂鉴权。
+全部业务端点挂在 `/api/v1` 下（`authMiddleware` 注入租户；`noauth` 模式固定 `default` 租户，`apikey` 模式校验 `X-API-Key`）。`GET /healthz`、`GET /metrics`、`GET /api/v1/auth/status` 不挂鉴权；`GET /api/v1/ws` 用短期 ticket 握手（`GET /api/v1/ws/ticket` 换取，30s 一次性，长期密钥不进 URL）。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/webhook/:provider` | 接收告警 push（provider 为注册表 kind，如 `prometheus`），批量归一化入管线 → `{accepted, processed, events}` |
+| POST | `/webhook/:provider` | 接收告警 push（provider 为注册表 kind：`prometheus` / `grafana` / `generic`），批量归一化入管线 → `{accepted, processed, events}` |
+| POST | `/webhook/generic` | **通用告警入口（一条 curl 接入）**：`{title, severity, status, source, dedupKey, labels, description}`；severity 别名归一化（p0→critical、error→high、warning→medium、notice→info）；description 只进快照不进指纹；非法 severity/status → 400 清晰错误 |
 | GET | `/alerts` | 告警列表 `?status=&severity=&provider=&from=&to=&limit=&offset=`（created_at 倒序） |
 | GET | `/alerts/:id` | 告警详情（DTO） |
 | GET | `/alerts/:id/history` | 同 fingerprint 去重演进历史（≤50 条） |
@@ -297,8 +369,21 @@ curl -X POST localhost:8080/api/v1/maintenance-windows -H 'Content-Type: applica
 | GET | `/incidents` | 事故列表 `?status=&limit=&offset=` |
 | GET | `/incidents/:id` | 事故详情（聚合关联告警 + 编排器状态 `state` + `nodeResults` monitor/rca/heal/change） |
 | POST | `/incidents/:id/resolve` | 手动解决（闭环）→ `{status:"resolved"}` |
+| PUT | `/incidents/:id/resolution` | 结案数据（仅已解决事故）：`{confirmedRootCause, resolution, outcome, verification, verificationStatus, postmortemUrl, resolvedBy}`，version 递增（RAG 知识来源） |
 | POST | `/incidents/:id/approval` | 分级审批 `{decision: approve\|reject, actor, reason}` → approve 闭环 resolved / reject 保持 open |
 | GET | `/incidents/:id/audits` | 审计轨迹（who/when/what/why，correlation_id 贯穿） |
+| GET | `/incidents/:id/similar` | 相似历史事故（RAG 只读；关闭时 `{enabled:false}`）：来源/可信等级/处置结果/分数/理由 |
+| GET | `/incidents/:id/knowledge-status` | 结案→发布→索引三态（KEEPON M3）：`{resolved, resolutionFilled, indexed, document{trustLevel,status,sourceVersion}, job{status,lastError}}` |
+| POST | `/incidents/:id/rag-feedback` | 检索反馈 `{rating: useful\|not_useful\|wrong\|unsafe, documentId, traceId?}`；unsafe 立即 quarantine 文档 |
+| GET | `/incidents/:id/rag-trace` | 本次事故检索轨迹（管理权限，`AIOPS_RAGADMINAPIS`） |
+| GET | `/rag/status` | 索引/向量一致性/积压/失败任务/**文档级统计**（管理权限） |
+| POST | `/rag/reindex` | 全量重建索引（异步入队，202；进度见 rag/status，管理权限） |
+| GET/POST/PUT/DELETE | `/rag/golden-queries` | 检索评测集 CRUD（`{query, expectedSources[], tags, enabled, useful?}`；管理权限） |
+| POST | `/rag/sources/preview` | 知识源上传预览（front matter 解析 + 脱敏检查，无副作用；管理权限） |
+| GET/POST | `/rag/sources` | 知识源列表（含派生索引状态）/ 创建草稿 |
+| GET/PUT | `/rag/sources/:id` | 详情（编辑回显）/ 更新（published 且内容变化 → 新版本自动发布） |
+| POST | `/rag/sources/:id/publish` | 发布（Sanitize 预检 → 版本+1 → 入队索引） |
+| DELETE | `/rag/sources/:id` | 删除（软删 + 撤销文档/向量） |
 | POST | `/notify/test` | 全渠道测试 `{title, content, severity}` → `{channels, results[]}` |
 | GET | `/notify/channels` | 渠道配置列表（含未启用） |
 | PUT | `/notify/channels/:name` | 更新渠道 `{enabled, webhook}`（保存即热重载；停用=静默） |
@@ -313,13 +398,26 @@ curl -X POST localhost:8080/api/v1/maintenance-windows -H 'Content-Type: applica
 | POST | `/workflows/:id/run` | 手动触发（`{alert_id?}`）→ `{runId, trigger:"manual", status}` |
 | GET | `/workflow-runs` | 运行记录（`trigger` 列 alert\|interval\|manual） |
 | GET/POST | `/rules` | CEL 关联规则列表 / 创建（`{name, celExpression, groupingCriteria[], threshold, runAgent, enabled}`） |
-| GET | `/providers` | 已注册数据源 provider 列表 |
+| GET | `/providers` | 已注册数据源 provider 列表（prometheus / grafana / generic） |
+| GET/PUT/POST | `/model-configs` / `/model-configs/:key` / `/model-configs/:key/test` | 大模型 API 配置管理（仅 Chat LLM 一行，apiKey 脱敏；PUT 保存、test 连通性；管理权限 `AIOPS_MODELCFGADMINAPIS`；Embedding 由 env 配置不走此端点） |
 | GET/POST | `/topology` | 服务拓扑节点列表 / 创建（`{name, kind, dependsOn[], recentChanges[]}`） |
 | GET | `/topology/:name/impact` | 影响面 `?depth=N`（SQL 递归 CTE 反向遍历依赖图） |
-| POST | `/apikeys` | 创建 API key → `{apiKey(仅此一次明文), tenantId}` |
-| GET | `/ws` | WebSocket 实时推送（事件：`alert.new/update/duplicate/suppressed`、`incident.upsert`、`incident.state`） |
+| GET/POST | `/apikeys` | 密钥列表（含 owner 标记）/ 创建 → `{apiKey(仅此一次明文), tenantId}` |
+| DELETE | `/apikeys/:id` | 撤销密钥（删除后立即失效） |
+| POST | `/apikeys/owner/regenerate` | 重新生成 owner key（旧 owner 撤销，明文一次） |
+| GET | `/auth/status` | 认证状态 `{mode: noauth\|apikey, hasKeys}`（前端解锁页守卫；免鉴权） |
+| GET | `/ws/ticket` | 签发 WS 握手短期 ticket `{ticket, ttlSec:30}`（需 X-API-Key） |
+| GET | `/ws` | WebSocket 实时推送（`?ticket=` 握手；事件：`alert.new/update/duplicate/suppressed`、`incident.upsert`、`incident.state`） |
+| GET/POST | `/backups` | 备份记录列表 / 手动触发（运行中 409；未启用 `AIOPS_BACKUPENABLED` 时 404） |
+| GET | `/overview` | **总览聚合**（`?window=24h`，上限 7d）：活跃计数 + 24h 趋势 + 严重度分布 + 最近事件（DB 重查）+ 系统健康/备份状态；默认首页与 `/wallboard` 数据源 |
+| GET | `/infra/metrics` | **基础设施指标**（监控平板数据源）：主机 CPU/内存/磁盘/Go 运行时 + PostgreSQL 连接/缓存命中/库大小 + docker 容器资源占用 + 近 60 点采样历史 |
+| POST/GET | `/assistant/threads` / `/assistant/threads/:id` | **AI 助手**：会话创建/列表/详情（软删 DELETE；消息列表 GET `/:id/messages`） |
+| POST | `/assistant/threads/:id/messages` | 发送消息（**必须带 `Idempotency-Key` 头**防重复；202 → `{threadId,messageId,runId}`） |
+| GET | `/assistant/runs/:id` | run 详情（状态/错误码/步骤） |
+| GET | `/assistant/runs/:id/events` | **run 事件 SSE 流**（`?lastSequence=N` 断线续传；事件：run.* / message.delta / tool.* / heartbeat） |
+| POST | `/assistant/runs/:id/cancel` | 取消 run（仅 queued/running 可取消） |
 | GET | `/healthz` | 健康检查 |
-| GET | `/metrics` | Prometheus 文本格式指标 |
+| GET | `/metrics` | Prometheus 文本格式指标（含 `aiops_backup_state` 等备份指标） |
 
 ## 配置项（环境变量，前缀 `AIOPS_`）
 
@@ -347,6 +445,9 @@ curl -X POST localhost:8080/api/v1/maintenance-windows -H 'Content-Type: applica
 | 通知 | `AIOPS_NOTIFIERCHANNELS` | — | 逗号分隔启用渠道 `dingtalk,feishu,wecom,http`（env 仅首启种子，DB 为准） |
 | 通知 | `AIOPS_NOTIFIER{DINGTALK,FEISHU,WECOM,HTTP}` | — | 各渠道 webhook 地址 |
 | 通知 | `AIOPS_NOTIFIERBASEURL` | `http://localhost:5173` | 前端地址（拼接事故详情链接） |
+| 通知节流 | `AIOPS_NOTIFYENABLED` | `true` | 告警级通知（同 fingerprint 首条立即 → 冷却合并 → 升级/恢复突破 → 周期汇总）；无渠道 fail-open |
+| 通知节流 | `AIOPS_NOTIFYCOOLDOWNSEC` | `300` | 冷却秒（0=每事件都发，关闭节流） |
+| 通知节流 | `AIOPS_NOTIFYSUMMARYMIN` | `30` | 汇总周期分钟（0=关闭汇总；冷却期内重复按"过去 30 分钟重复 47 次"合并通知） |
 | Agent | `AIOPS_AGENTDRYRUN` | `true` | 自愈动作默认 dry-run（安全优先） |
 | Agent | `AIOPS_AGENTENABLED` | `true` | 是否投递 agent.run 任务 |
 | Agent | `AIOPS_RCACONFIDENCE` | `0.3` | RCA 置信度门槛 |
@@ -361,6 +462,67 @@ curl -X POST localhost:8080/api/v1/maintenance-windows -H 'Content-Type: applica
 | 工作流 | `AIOPS_WORKFLOWENABLED` | `true` | pipeline 投递 workflow.trigger 并消费 |
 | 工作流 | `AIOPS_WORKFLOWEXECWORKERS` | `8` | 工作流执行并发上限 |
 | 工作流 | `AIOPS_WORKFLOWSCHEDINTERVALSEC` | `10` | interval 触发器扫描间隔秒 |
+| RAG | `AIOPS_RAGENABLED` | `false` | 知识检索层总开关（默认关闭，现有行为不变） |
+| RAG | `AIOPS_RAGMODE` | `off` | `off\|readonly`（本期只读；shadow/assist 配置即报错） |
+| RAG | `AIOPS_RAGRETRIEVALTIMEOUTMS` | `800` | 检索总超时毫秒（超时立即降级，不阻塞） |
+| RAG | `AIOPS_RAGTOPK{KEYWORD,VECTOR,FINAL}` | `40`/`40`/`6` | 关键词/向量召回条数 / 融合后最终证据条数 |
+| RAG | `AIOPS_RAGMAXCONTEXTTOKENS` | `5000` | RAG 上下文 token 预算（单文档 40% 上限） |
+| RAG | `AIOPS_RAGINDEXWORKERS` | `2` | 索引 worker 并发数（SKIP LOCKED 领取） |
+| RAG | `AIOPS_RAGINDEXVERSION` | `v1` | 在线索引版本（换模型/维度必须递增并 `POST /rag/reindex` 重建） |
+| RAG | `AIOPS_RAGINDEXINTERVALSEC` | `5` | 索引 worker 轮询间隔秒 |
+| RAG | `AIOPS_RAGINDEXHNSW` | `false` | 向量 HNSW 索引（默认精确扫描基线；数据量大后启用） |
+| RAG | `AIOPS_RAGBACKFILLONBOOT` | `true` | 启动回填已解决事故与已启用剧本（幂等） |
+| RAG | `AIOPS_RAGADMINAPIS` | `false` | 管理端点（rag/status、reindex、rag-trace）开关；apikey 模式还需租户在 `AIOPS_RAGADMINTENANTS` 白名单 |
+| RAG | `AIOPS_RAGADMINTENANTS` | — | 允许管理端点的租户（逗号分隔，apikey 模式） |
+| 模型管理 | `AIOPS_MODELCFGADMINAPIS` | `false` | 模型配置管理端点（携带密钥，独立管理开关；默认 403） |
+| 模型管理 | `AIOPS_MODELCFGADMINTENANTS` | — | 允许管理模型配置的租户（逗号分隔，apikey 模式） |
+| Embedding | `AIOPS_EMBEDDINGDRIVER` | `off` | `off`（关键词-only）\| `openai-compat` \| `local`（确定性 mock，仅演示/测试） |
+| Embedding | `AIOPS_EMBEDDINGBASEURL` / `AIOPS_EMBEDDINGMODEL` | — | OpenAI 兼容 `/embeddings` 端点 / 模型（与 Chat LLM 分开配置；**仅 env 配置，无 UI 入口**） |
+| Embedding | `AIOPS_EMBEDDINGDIMENSION` | `0` | 向量维度（索引契约；与在线列不一致时报错/禁用向量路） |
+| Embedding | `AIOPS_EMBEDDINGTIMEOUTSEC` | `10` | 单次 embedding 请求超时秒 |
+| Embedding | `AIOPS_EMBEDDINGBATCHSIZE` | `32` | 批量 embedding 分片条数（千问 text-embedding 建议 16） |
+
+千问 Embedding 接入示例（仅 env，无 UI 入口）：
+
+```bash
+export AIOPS_EMBEDDINGDRIVER=openai-compat
+export AIOPS_EMBEDDINGBASEURL=https://dashscope.aliyuncs.com/compatible-mode/v1
+export AIOPS_EMBEDDINGAPIKEY=sk-xxx
+export AIOPS_EMBEDDINGMODEL=text-embedding-v3
+export AIOPS_EMBEDDINGDIMENSION=1024
+export AIOPS_EMBEDDINGBATCHSIZE=16
+```
+| AI 助手 | `AIOPS_ASSISTANTENABLED` | `false` | 对话式 Agent 总开关（默认关闭；功能关闭时 `/assistant` 端点全部 404，现有路径零变化） |
+| AI 助手 | `AIOPS_ASSISTANTREADONLY` | `true` | 只读模式（动作工具 Phase 3 开放，字段先立） |
+| AI 助手 | `AIOPS_ASSISTANTMAXCONCURRENCY` | `4` | 并发 run worker 数（独立 DB 租约 + 信号量，不挤占告警热路径） |
+| AI 助手 | `AIOPS_ASSISTANTMAXMODELROUNDS` / `AIOPS_ASSISTANTMAXTOOLCALLS` | `8`/`12` | 单 run 模型回合 / 工具调用预算（超限安全终止） |
+| AI 助手 | `AIOPS_ASSISTANTRUNTIMEOUTSEC` / `AIOPS_ASSISTANTTOOLTIMEOUTSEC` | `60`/`3` | 单 run 总超时 / 单工具执行超时 |
+| AI 助手 | `AIOPS_ASSISTANTRETENTIONDAYS` / `AIOPS_ASSISTANTPROMPTVERSION` | `90`/`v1` | 会话保留天数（Phase 4 启用清理）/ 系统提示词版本 |
+| AI 助手 | `AIOPS_ASSISTANTCHAT{DRIVER,BASEURL,APIKEY,MODEL,TIMEOUTSEC,STREAM}` | — | 对话生成模型端点（OpenAI 兼容，需支持 tool calling；**模型配置页 Assistant Chat 行可管理，env 仅首启种子**） |
+
+对话式 Agent 快速启用（AI 助手页）：
+
+```bash
+# 1) 本地 mock（无 key 联调）：node deploy/mock_llm.mjs 9999
+# 2) 后端指向 mock（或模型配置页填 Assistant Chat）
+export AIOPS_ASSISTANTENABLED=true
+export AIOPS_ASSISTANTCHATBASEURL=http://localhost:9998   # 或千问/DeepSeek 兼容端点
+export AIOPS_ASSISTANTCHATAPIKEY=dummy
+export AIOPS_ASSISTANTCHATMODEL=mock
+```
+| 日志 | `AIOPS_LOGFILE` | — | 日志文件路径（设置后 stdout+文件双写，Docker 不配则纯 stdout）；日志全局脱敏（apiKey/token/URL 查询参数 → `[REDACTED]`） |
+| 日志 | `AIOPS_LOGMAXMB` / `AIOPS_LOGMAXBACKUPS` / `AIOPS_LOGMAXAGEDAYS` | `100`/`10`/`30` | 单文件轮转 MB / 保留轮转文件数 / 保留天数（≈1GB 总上限） |
+| 日志 | `AIOPS_LOGREQUESTS` | `true` | HTTP 访问日志（含 requestID；path 经脱敏） |
+| 备份 | `AIOPS_BACKUPENABLED` | `false` | 数据备份 worker（定时 pg_dump -Fc；恢复见 `scripts/restore.sh` 与 `docs/RESTORE.md`） |
+| 备份 | `AIOPS_BACKUPINTERVALHOURS` | `24` | 执行间隔小时（距上次成功超间隔才补跑；启动补跑开关 `AIOPS_BACKUPONBOOT`） |
+| 备份 | `AIOPS_BACKUPDIR` | `./backups` | 备份目录（0700 创建、文件 0600） |
+| 备份 | `AIOPS_BACKUPKEEP` / `AIOPS_BACKUPMAXGB` | `10`/`5` | 保留份数 / 总容量上限（双限任一达限删最旧） |
+| 备份 | `AIOPS_BACKUPMIRRORDIR` | — | 异地镜像目录（另一磁盘/NAS 挂载点；空=不镜像） |
+| 备份 | `AIOPS_BACKUPMIRRORENCRYPT` | `false` | 镜像 AES-256-GCM 加密（需 `AIOPS_BACKUPPASSPHRASEFILE` 口令文件，权限 0600） |
+| 备份 | `AIOPS_BACKUPPASSPHRASEFILE` | — | 镜像加密口令文件路径（加密必填；丢失则镜像不可恢复） |
+| 备份 | `AIOPS_BACKUPPGCONTAINER` | `aiops-postgres` | pg 工具执行方式：docker exec 容器名 / `host`（本机 pg 客户端） |
+| 备份 | `AIOPS_BACKUPVERIFY` | `true` | 备份后恢复到临时库校验关键表计数（通过后自动清理临时库） |
+| 备份 | `AIOPS_BACKUPTIMEOUTMIN` | `60` | 单次备份超时分钟 |
 
 ## 常用命令（Makefile）
 

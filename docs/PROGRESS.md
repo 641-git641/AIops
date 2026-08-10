@@ -1,7 +1,7 @@
 # AIOps 告警平台 — 项目进度交接文档
 
 > 用途：跨会话/换窗口继续开发的现状快照。任何新窗口先读本文件 + README.md + **docs/GUIDE.md**（架构与功能使用深度指南）+ **docs/GLOSSARY.md**（运维概念与黑话入门）。
-> 最后更新：2026-08-08（Phase 3d dedup 单读 P50 -30%/P99 -23%；Phase 3e HTTP 超时调优；Phase 3f loadgen CI 回归基准；Phase 3g SaveAlerts 批量写完成——batch 20 请求延迟 973→197ms）
+> 最后更新：2026-08-10（Phase 8 KEEPON M3 + 基础设施指标 + **Phase 9 对话式 Agent 阶段二：事故诊断与 RAG 引用**，详见 §1 Phase 9）
 
 ---
 
@@ -198,6 +198,191 @@ Alert → process_event ──┬── 确定性热路径（去重 → 入库 �
   **请求延迟 -80%（973→197ms）、失败率 5%→0%**，吞吐持平——瓶颈从「N 事件 × 2 次串行往返」降到「每批 2 次往返 + 逐条副作用」。指标：new 2461 / update 26561 / duplicated 6981（批内 overlay 去重正确拦截同内容）。
 - **Makefile**：仿三目标加 `-batch` 版本（`bench-batch` / `regress-batch` / `regress-baseline-batch`，`BENCH_BATCH ?= 20`，输出 `.bench/*-batch.json`）。
 - **e2e 批内三态**：一个 POST 带 3 条同 fingerprint 事件（内容 A / 重复 A / 内容 B，`instance` label 区分）→ accepted 3、processed 3、alerts **+2**（duplicate 跳过）、last_alerts 折叠指向内容 B；无孤立 incident。压测数据按名清理，DB 恢复 129 alerts / 123 last_alerts / 56 incidents / 孤立 0。
+
+---
+
+### Phase 4 — RAG 知识检索（RAG_PLAN.md Phase 0~2 首期落地）✅（当前最新）
+- **范围**：按 RAG_PLAN.md 实施 **Phase 0（结案数据契约）+ Phase 1（知识底座与离线索引）+ Phase 2（相似事故只读能力）**。不做 RCA Shadow/assist/文档治理/reranker（后续阶段）；**默认 `AIOPS_RAGENABLED=false`，off 模式现有行为逐字节不变**（`make regress` 门禁验证）；RAG 不进热路径（webhook/去重/规则/WS 零改动）。
+- **Phase 0 结案数据**：`incident_resolutions` 一对一（UNIQUE(tenant_id, incident_id)），`version` 递增为索引 source_version；`verified` 强制要求确认根因+处置（数据质量门禁）；`PUT /incidents/:id/resolution` 仅已解决事故可填；详情响应带 `resolution`。
+- **知识底座（Phase 1）**：
+  - docker-compose 镜像升级 **pgvector/pgvector:pg16**（同 PG16 大版本，`aiops_pgdata` 卷兼容，升级前已备份）；`rag.EnsureSchema` 显式 SQL 管理扩展/向量列/tsvector/GIN/HNSW 索引（**实测坑：pgvector 0.8.x 的 atttypmod = 维度本身，不是 dim+1**）。
+  - 6 张知识表（documents/chunks/embeddings/jobs + traces/feedback），GORM AutoMigrate 建普通表 + 裸 SQL 管 vector/tsvector 列；`Vec` 实现 Scanner/Valuer，SQL 显式 `::vector`/`::text`。
+  - `internal/embedding/`：Provider 接口 + openai-compat `/embeddings` 客户端（batch 分片/超时/维度学习与漂移检测）+ mock 确定性实现；独立于 Chat LLM 配置。
+  - `internal/rag/` 纯函数层：sanitizer（token/私钥/DSN/webhook/内网 IP/邮箱/手机脱敏；疑似未分类密钥→任务失败不提交外部模型；提示注入风险标签）、chunker（语义字段边界切片、行级硬切不截断标识符、每 chunk 带来源头）、builder（事故/剧本文档规范化，区分现象/确定性证据/人工根因；剧本命令模板不出域；verified+success→T3、partial→T2、unverified/false_positive→T1、rejected 不入库）、query（白名单标签 + 错误码提取）。
+  - **持久化索引 worker**：`knowledge_jobs` 表驱动（**不用内存队列**），`FOR UPDATE SKIP LOCKED` 领取、2min 租约崩溃复活、指数退避 8 次上限进 dead、`ON CONFLICT` 幂等入队（复活 failed/dead）、启动回填（已解决事故+已启用剧本）、10min reconciliation 对账（剧本启用/停用失步、结案版本高于文档版本、孤儿文档）。
+  - **删除传播**：active 文档软删（保留审计）+ chunk/embedding 物理撤销；unsafe 反馈 → quarantine 立即退出召回。
+- **相似事故只读（Phase 2）**：
+  - 三路并行召回：精确（service/告警名/错误码 metadata @> JSONB）+ 关键词（FTS simple + pg_trgm similarity>0.2，中文靠 trigram+向量路，simple FTS 中文弱是已知限制）+ 向量（cosine，模型/维度/索引版本一致性检查不过则跳过向量路降级关键词）。
+  - RRF(k=60) 融合 + 业务加权（同服务/T3/verified/近期，理由记录进证据包）+ 同文档 ≤2 chunk 去重 + 来源多样性（至少一条剧本）+ 上下文预算（总 5000 tokens、单文档 40%）。
+  - **全部 fail-open**：任一/全部路失败只降级（degraded_reason 枚举），`Retrieve` 永不返回 error；总超时 800ms（实测 ~7ms）。
+  - API：`GET /incidents/:id/similar`（来源/可信等级/处置结果/分数/理由）、`POST rag-feedback`（unsafe→quarantine）、`GET rag-trace`/`GET rag/status`/`POST rag/reindex`（管理权限 `AIOPS_RAGADMINAPIS`+`AIOPS_RAGADMINTENANTS`）。
+  - 指标：`aiops_rag_retrieval_total{result,degraded_reason}`、分路耗时直方图、索引任务/积压/滞后、embedding 请求、反馈计数（零依赖注册表，histogram 无标签用指标名区分 stage）。
+- **前端**：Incident 详情页新增「结案数据」卡片（表单 Modal：根因/处置/结果/验证状态）+「相似历史事故」区（来源/可信/结果 Tag、相似度、理由、反馈下拉：useful/not_useful/wrong/unsafe）。
+- **测试**：纯函数层单测（sanitizer/chunker/builder/query/fusion/预算/vec）+ embedding httptest（batch 分片/Bearer/超时/错误）+ **DB 门控集成测试**（真实 SQL 全链路：入队→worker→三路召回→跨租户零泄漏→unsafe quarantine→删除传播；PG 未运行自动跳过）+ resolution 集成测试。
+- **顺带修复**：未配置 `AIOPS_LLMAPIKEY` 时 `var rcaLLM agent.RCALLM = llmClient` 把 typed-nil `*ai.Client` 装进接口导致 RCA enhance 空指针 panic（接口非 nil 使 nil 守卫失效）——改为未配置时接口保持 nil。
+- **e2e 验证**（readonly + local embedding + 管理 API）：回填 9 任务全 succeeded；发告警→解决→填结案（version 1）→ 索引 succeeded（v0 T1 + v1 T3 双版本文档并存）；similar 返回 6 条（同服务 exact 排首 + T3 加权 + 剧本多样性，总延迟 ~7ms）；unsafe 反馈 → quarantined → 立即退出召回；rag-trace 记录候选/延迟明细；reindex 入队 10 全 succeeded；`make regress` 热路径无回退。
+- **已知限制**（按 RAG_PLAN 文档化）：中文关键词召回弱（trigram+向量补充，超门槛再评估 OpenSearch）；trace/feedback 暂不进保留策略清理；首期不接本地真 Embedding 模型（local 驱动为确定性 mock）；HNSW 未启用（精确扫描基线）。
+
+---
+
+### Phase 5 — 数据接入与模型管理（Grafana + Prometheus 文档 + 大模型 API 管理）✅（当前最新）
+- **Grafana 接入**（`internal/provider/builtin/grafana.go`，`kind="grafana"`）：解析 Grafana Unified Alerting webhook（`POST /api/v1/webhook/grafana`）；labels/annotations 归一化同 Alertmanager 语义，`generatorURL/fingerprint/values` 存入告警 Event；独立实现（one provider one file，init 自注册，webhook 链/注册表零改动）；4 个单测（映射/兜底/顶层 status/非法 JSON）。
+- **Prometheus 文档**：README/GUIDE 数据接入章节——alertmanager.yml `receivers.webhook_configs` 配置示例 + Grafana Contact points 配置步骤（零代码改动）。
+- **大模型 API 接入管理（DB 化，仿通知渠道模式）**：
+  - 新包 `internal/modelcfg`：`model_configs` 表固定两行（`chat`/`embedding`，各自 kind/enabled/baseURL/apiKey/model/dimension/timeoutSec/batchSize/stream）；**apiKey 只入库永不进 API 响应**（DTO `apiKeySet` 代替）；`Save` 的 apiKey 传空=保留旧值；`Test` 连通性（chat→chat/completions、embedding→/embeddings，表单值优先 DB 兜底）。
+  - **装配改造**（main.go 4.5/4.7）：`EnsureDefaults`（env 首启种子：chat 需 env key、embedding 需 openai-compat；local/off 不种保留 mock 路径）→ `ResolveChat/ResolveEmbedding` 生效值（**DB 行优先、无行回退 env、DB 读失败 fail-open 回退 env**）→ 4.7 段**装配二次校验**（生效值复刻 config.Load 规则：baseURL/model 必填、dimension>0，失败退出——因 config.Load 只校验 env）；DB embedding 行恒 openai-compat、disabled 行=off（停用=静默）；typed-nil 坑保持原修复。
+  - 管理端点：`GET/PUT /model-configs`、`POST /model-configs/:key/test`，**独立管理开关 `AIOPS_MODELCFGADMINAPIS`**（默认 false→403，密钥场景不复用 RAGAdminAPIs）+ apikey 租户白名单。
+  - 前端「模型配置」页（`web/src/pages/ModelConfigs.tsx`）：两行表格（Chat/Embedding）、`Input.Password`（placeholder 按 apiKeySet 提示）、参数列（chat：超时+流式；embedding：维度+超时+批量）、测试连通性按钮、403 时顶部 Alert 提示开关配置、页脚明示"保存后重启生效"。
+  - 测试：modelcfg 纯函数（生效值/脱敏/校验）+ **DB 门控连通性测试**（httptest mock chat/embeddings + 500 场景 + apiKey 保留 + List 脱敏断言）+ config 新键命名锁定。
+- **e2e 验证**：Grafana webhook 归一化正确（name=annotations.summary、labels 完整）；model-configs 列表两行脱敏；PUT 保存（apiKeySet=true、timeout 默认 15）；apiKey 空保存保留旧值；chat 连通性测试（mock_llm）ok；embedding 维度校验报错；**重启后 `llm enhancer enabled source=db`（不配任何 LLM env）→ critical 告警 rca 同时有确定性 rootCause + llmRootCause**；停 mock_llm → `llm enhance skipped` fail-open 不变；默认 `MODELCFGADMINAPIS=false` → 端点 403。
+- **已知限制**：模型配置保存后需重启后端生效（客户端启动装配，无热重载——刻意避免装配重构风险）；apiKey 明文存 DB（本地项目；生产建议加密存储或 secrets 管理）；`model_configs` 的 chat 停用 = RCA 纯确定性（不回退 env）。
+- **后续变更（Phase 8c）**：embedding 已从 `model_configs` 表移除管理——仅 Chat LLM 一行，Embedding 由 `AIOPS_EMBEDDING*` env 直接配置（见 Phase 8c 节）。
+
+---
+
+### Phase 6 — KEEPON Milestone 1：P0 数据安全三件套（备份恢复 + 日志持久化 + 访问保护）✅（当前最新）
+
+按 KEEPON.md（个人专业化 AIOps 路线图）实施 M1；定位原则：默认关闭、行为不变、恢复不做网页按钮。
+
+- **数据备份与恢复**（`internal/backup/` + `backup_runs` 表）：
+  - `pg_dump -Fc` 定时备份：默认每 24h、距上次成功超间隔才补跑（`RunIfDue`，启动补跑开关 `AIOPS_BACKUPONBOOT`）；目录 0700/文件 0600。
+  - **执行方式**：`PgExecutor` 接口双实现——默认 `docker exec`（本机 Windows 无 pg_dump，容器内 16.14 已实测），`AIOPS_BACKUPPGCONTAINER=host` 逃生门（本机客户端）；密码只走 PGPASSWORD env 不进 argv；无 shell 拼接。
+  - 轮转 `Rotate`：数量+容量双限删最旧（只删 `aiops_*.dump[.aes]`）；镜像 `AIOPS_BACKUPMIRRORDIR` 可选 AES-256-GCM 加密（`crypto.go`：magic+salt+nonce+PBKDF2 100k，`cmd/backup-tool decrypt` 解密）。
+  - 恢复校验 `VerifyFromFile`：临时库 `aiops_bkverify_<ts>` → pg_restore → 5 张关键表计数 → 自动 drop；**stdin 管道不支持 pg_restore 并行（-j）**（实测踩坑，去并行）。
+  - 恢复：`scripts/restore.sh`（`--verify` 演练 / `--target` 真实恢复，交互二次确认 + 提示停 app）+ `docs/RESTORE.md`（含加密镜像解密、换机迁移清单）。**恢复不做网页按钮**。
+  - API：`GET /backups`（列表）、`POST /backups`（手动触发，运行中 409；未启用时 404 带指引）；metrics：`aiops_backup_state` / `last_success_age_seconds` / `runs_total{result}`。
+  - 配置：`AIOPS_BACKUP{ENABLED,INTERVALHOURS,DIR,KEEP,MAXGB,MIRRORDIR,MIRRORENCRYPT,PASSPHRASEFILE,PGCONTAINER,VERIFY,TIMEOUTMIN,ONBOOT}`（默认全关）。
+- **日志持久化**（lumberjack v2.2.1，唯一新增 Go 依赖）：
+  - `setupLogger(cfg)`：`AIOPS_LOGFILE` 时 stdout+文件双写（Docker 不配则纯 stdout），大小/数量/天数三重轮转（默认 ≈1GB 上限），`AIOPS_LOGREQUESTS=false` 关访问日志。
+  - **全局脱敏**（`internal/logutil/redact.go`，slog ReplaceAttr）：敏感 key（apikey/secret/token/authorization/ticket…）→ `[REDACTED]`；URL 查询参数独立清单遮蔽（`?access_token=`、`?ticket=` 等），解析失败整段打码；嵌套 group 递归。
+  - **请求 ID**（`internal/api/requestlog.go`）：X-Request-Id 沿用/生成 + 回写响应头；访问日志（method/path 脱敏/status/duration/tenant/requestID）；webhook 处理器改用 `c.Request.Context()` 继承。
+- **简单访问保护**（KEEPON 4.3，`AIOPS_AUTHTYPE=apikey` 启用）：
+  - **owner key 引导**：`auth.EnsureOwnerKey`（表空 → 生成 owner 标记 key，明文 `fmt` 直打 stdout **不经 slog** 防落日志文件）；表空重启自动重打（已实测闭环）；`POST /apikeys/owner/regenerate` 重新生成（事务删旧+新建）。
+  - **前端解锁**：`/unlock` 页（无凭据自动进入，AuthGate 守卫 `GET /auth/status`）；凭据仅存 `sessionStorage`；api.ts 统一带 `X-API-Key`，401 自动清凭据跳解锁。
+  - **WS ticket**：`GET /ws/ticket`（受保护，30s TTL 一次性，绑定租户）→ `ws?ticket=`（`/ws` 移出鉴权组改用 `wsAuthMiddleware`；noauth 直通）；ticket 进日志脱敏清单。
+  - 密钥管理：`GET/DELETE /apikeys`、`POST /apikeys/owner/regenerate` + 前端「设置 → 访问密钥」（新建 Modal 明文一次 / 撤销 Popconfirm / noauth 提示）。
+- **前端**：新页面 `Settings.tsx`（Tabs：数据备份——状态卡+记录表+立即备份+未启用提示；访问密钥）；navItems 加「设置」；`/unlock` 在 AuthGate 外。
+- **e2e 验证（2026-08-09，:8081 全功能实例）**：owner key 打印且日志文件零泄漏；无 key 401；webhook 带 key 正常；撤销立即 401；表空重启重打 owner key；WS ticket 签发 30s；备份启动补跑 success+verify passed（15MB/约 6s）；手动触发 + 并发 409；加密镜像解密后 sha256 与本地一致；`restore.sh --verify` 临时库计数一致（70|131366|11|0|1）；**完整恢复演练** `--target aiops_restore_full_test`（dropdb+createdb+pg_restore 全路径 + 计数一致 + 临时库清理）；访问日志 `access_token=[REDACTED]`。
+- **踩坑记录**：① 备份文件名同秒冲突（interval=0 补跑）→ 时间戳加毫秒 + run ID 前缀；② **pg_restore stdin 管道不支持 -j 并行**（"parallel restore from standard input is not supported"）→ 去并行；③ backup.Service nil metrics panic → `incMetric` 守卫；④ `config.DBDSN` 空时备份 DSN 需回退 `store.DefaultDSN`（与 store.Open 一致）；⑤ Go flag 包遇首个非 flag 参数停止 → backup-tool 手动解析参数（flag 位置无关）；⑥ 撤销唯一 owner key 后 regenerate 也 401（正确语义：先恢复再重生成，或表空重启自动重打）。
+- **已知限制**：备份默认关闭（`AIOPS_BACKUPENABLED=true` 开启）；恢复校验每次备份都跑一次临时库（单人规模可接受）；口令文件明文存储（权限 0600，与加密镜像分开存放）；owner key 明文只在 stdout 一次（丢失后表空重启重打）。
+
+---
+
+### Phase 7 — KEEPON Milestone 2：一眼看到 + 一条命令接入 + 通知节流 ✅（当前最新）
+
+按 KEEPON.md M2 实施（总览/大屏 + generic 入口 + 通知节流），默认行为不变。
+
+- **总览聚合**（`internal/overview/` 新包 + `GET /api/v1/overview?window=24h`）：
+  - 裸 SQL 聚合（alerts 分区表**强制 created_at 条件触发分区裁剪**，补 `idx_alerts_tenant_created_at` 索引）：活跃告警（last_alerts 非 resolved）/活跃事故/知识条目计数；`date_trunc('hour')` 趋势（**Go 侧补零**，不 generate_series）；严重度分布（固定 5 键补 0）。
+  - **最近事件 = alerts + audit_logs 两路各 10 条 Go 归并取 20**（DB 重查，页面刷新可恢复，不依赖 WS 内存——KEEPON 完成标准）；`EventItem.Kind=alert|audit`。
+  - 系统健康：`sqlDB.PingContext` 2s 超时 + 队列深度（q.Len）+ RAG backlog/lag + **uptime**（main.go `startTime`）+ 最近备份（bkSvc.LastSuccess）。
+  - 依赖接口化（`RAGStatuser`/`BackupLister` 导出接口）；**typed-nil 防护：nil 具体指针（RAG/备份关闭）显式转 nil 接口**（装配层 if 判空转换，否则接口判空失效 panic——已实测踩坑）。
+- **generic 通用告警入口**（`internal/provider/builtin/generic.go`，Kind="generic"，init 自注册）：
+  - 契约 `{title, severity, status, source, dedupKey, labels, description}`；title 必填；severity 白名单（p0/severe/critical/error/high/warning/warn/medium/low/notice/info，非法 → 400 列出合法值）；status 白名单 firing|resolved（缺失默认 firing）；source 默认 "generic"。
+  - **`dedupKey → Labels["dedupKey"]` 参与指纹**（同 dedupKey 稳定去重）；**`description` 只进 Event 快照、绝不进 Labels**（含变化内容会破坏指纹——单测锁定"description 变化指纹不变"）。
+  - `normalizeSeverity/normalizeStatus` 改名导出（`alert.NormalizeSeverity/NormalizeStatus`，generic 与 BuildAlert 共用避免映射漂移）；`eventsToDTO` 回显归一化 severity/status + fingerprint + dedupKey。
+  - **前端接入向导**（`web/src/components/GuideCard.tsx`）：空状态可复制 curl（`window.location.origin` + apikey 模式自动带 X-API-Key）+「发送测试告警」按钮（POST generic 固定 payload，message 显示归一化结果与指纹前 8 位）；用于 Alerts 空状态与总览空状态（KEEPON 8.2 三步闭环第一步）。
+- **通知节流**（`internal/notifythrottle/` 新包，KEEPON 5.4）：
+  - **Throttler 内存状态机**（可注入时钟）：`Decide` 六分支——first（首条立即）/ cooldown（计数合并，FirstThrottled 才审计）/ upgrade（严重度升级突破，**保留 Count**）/ cooldown-expired（到期重置周期）/ resolved（发送 + 删除 entry 清冷却与未到点汇总）/ 孤儿 resolved 不发送；`DueSummaries` 锁内快照 + Count 重置 + 结算点滚动。
+  - **链路**：pipeline `finalizeSaved`（L319 后）`notifyTrigger` 钩子（仿 triggerAgent）→ `q.Enqueue(TaskNotifySend)`（热路径零阻塞）→ queue handler → `HandleNotifyTask`（Decide → `ntf.Notify` → 审计 notify.sent/failed/skipped（reason=first/upgrade/resolved/cooldown-expired）+ throttled 只记首条）；§6.8 汇总 worker（ticker 1min，`AIOPS_NOTIFYSUMMARYMIN` 周期，文案"过去 X 内重复 N 次（首次/最近/严重度）"）。
+  - **裁定**：走队列（统一并发模型 + 优雅退出）；节流状态内存可接受（重启首条 re-notify，reason 可解释）；throttled 不逐条审计（降噪目的不搬进审计）；**完全重复告警被物理去重丢弃，到不了通知层**（测试须 description 递增触发 DedupUpdate）。
+  - 配置：`AIOPS_NOTIFYENABLED`（默认 true，无渠道 fail-open）/ `AIOPS_NOTIFYCOOLDOWNSEC`（默认 300，0=关节流）/ `AIOPS_NOTIFYSUMMARYMIN`（默认 30，0=关汇总）。
+- **前端**：`Overview.tsx`（默认首页：Statistic 卡片 + **纯 CSS 柱状趋势**（无图表库）+ 严重度分段条 + 最近事件 List + 系统健康行；WS invalidate + 30s 轮询双驱动）；`Wallboard.tsx`（`/wallboard` 暗色大字只读，App MainLayout 内 useRealtime 恒调用后条件 return，hooks 顺序安全）；`/` 重定向 `/overview`；realtime.ts 加 overview 键；Alerts 空状态 GuideCard。
+- **e2e 验证（2026-08-10，:8081）**：generic 合法 → 200 回显归一化 severity（warning→medium）+ fingerprint；非法 severity → 400 清晰错误；**50 条同 dedupKey（description 递增）→ 审计仅 first×1 + throttled×1（降噪）→ critical 升级 → upgrade(count=49 保留积压) → resolved(count=49) → 再 firing 新 first → 汇总 worker 到期 notify.summary(count=49 + 首次/最近时间戳)**；overview 真实数据（activeAlerts=332/趋势 25 桶补零/分布/20 条归并事件/dbOk/uptime）；window 非法 400。
+- **踩坑记录**：① **typed-nil 复现**（RAG/备份关闭时 nil *rag.Service 赋接口 → 判空失效 → overview 500 panic）→ 导出接口 + 装配层显式 if 判空转换（与 rcaLLM 同款修复）；② :8081 端口被旧实例占用（重启前先 TaskStop）；③ eventsToDTO 回显原始 severity 不符"归一化摘要"→ 改 NormalizeSeverity；④ audit 查询 metadata 是 JSONB 需 ::text。
+- **已知限制**：节流状态内存态（重启丢失，首条 re-notify 可解释）；通知渠道配置在 DB（`notification_channels` 表持久化，e2e 时旧 http 渠道指向 9997 导致 notify.failed——决策与内容正确，fail-open 符合设计）；trend 桶数为 window 小时数 + 当前整点（24h 窗口 25 桶）；`/wallboard` 为独立暗色页（全局未引入暗色主题）。
+
+---
+
+### Phase 8 — KEEPON Milestone 3：结案即知识（发布交互 + 三态展示 + 检索评测 + runbook 导入）✅（当前最新）
+
+按 KEEPON.md M3 实施（用户确认 M3 全部 4 项）；结案链路后端零改动（resHook 已入队），增量全在状态展示/评测/知识源。
+
+- **① 结案发布交互与三态展示**：
+  - `GET /incidents/:id/knowledge-status`（无 admin gate，tenant 隔离）：4 条强制 tenant SQL（incidents.status / resolution count+version / 最新一版文档（任意 status）/ 最近 job）→ `{resolved, resolutionFilled, indexed, document{trustLevel,verificationStatus,status,sourceVersion,updatedAt}, job{operation,status,lastError}}`；**indexed 以 active 文档存在为准**（job 只做展示与失败原因）；Raw Scan 无行时 err 为 nil——用 count/主键非空判定（零值对象坑已修）。
+  - 前端 ResolutionCard 升级：Modal 带出区（detail 已有数据——现象/关联告警/RCA 根因，**确定性证据 vs LLM 推测 Tag 标注来源**）；okText「结案并发布到知识库」；KnowledgeStatusBlock 三态 Tag 行 + 文案（未结案→"填写即发布"、索引中→3s 轮询 Spin、失败→红字 lastError、已索引→「已发布 · T3 已验证 · 索引完成 · 版本 N」、quarantined→橙色"已隔离，重新填写发布可恢复"）；**轮询仅 job pending/running 时 3s**。
+- **② rag/status 文档级统计**：`Documents{Total,Active,Superseded,Deleted,Failed,Quarantined,Chunks,Embeddings,BySourceType}`（GROUP BY status + chunks/embeddings count + active GROUP BY source_type）。
+- **③ 检索 golden set 评测**：
+  - `rag_golden_queries` 表（query/service/severity/**expected_sources（source_id 数组——eval 时映射 active 文档，源版本更新后评测自动命中新版本）**/tags/enabled/useful 人工反馈/note）；CRUD API（admin gate，校验 expected 为该租户真实 source）。
+  - `internal/rag/eval.go` 的 `RunEval`（库函数）：expected→active 文档 id 集合 → `RetrievalQuery{Summary: query}` + `svc.Retrieve`（与线上完全同链路）→ 指标：**AnyHitRate@K（Candidates 主口径）/MeanRecall/Selected 口径/首条命中（空结果计 miss + 非空分母）/EmptyRate/延迟 P95/降级分布/useful 覆盖率** + PerQuery 明细。
+  - `cmd/rag-eval` flag 壳：`-dsn/-tenant/-topk-*/-max-tokens/-embedding off|auto/-json/-baseline(-fail-on-regression)/-list`；**-embedding auto 在 env 未配置时从 LoadIndexMeta 反推 local mock**（mock 是确定性 n-gram，跨进程一致）。
+- **④ Markdown/runbook 知识源**：
+  - `knowledge_sources` 表（name/content 原文/front_matter jsonb/service/status draft|published|deleted（quarantined 由 unsafe 反馈联动作展示辅助）/version/content_hash）；**前端拖拽上传（beforeUpload 拦截 + file.text() 走 JSON API，免 multipart）**。
+  - `ParseFrontMatter` 纯函数（仅首部 `---` 块；白名单 title/service/tags/updated_at；正文 `---` 不误伤；BOM 容忍）；`BuildRunbook`（published→**T2/verified**，draft→不建文档；Title "runbook：" 前缀；tags/source_name 进 Meta——**写入侧无白名单**，白名单只在查询侧）；Body 对齐"标签：内容"行风格。
+  - 生命周期：preview（解析+Sanitize 检查无副作用）→ create draft → publish（Sanitize 预检 400 阻断 → version+1 → **同事务 EnqueueJob**）→ indexer `processUpsert` case SourceRunbook（loadRunbookSource：源不存在→deleteSource 传播）→ Backfill/Reconcile 追加 runbook 段 + 孤儿检测 UNION 分支；UpdateSource（published 且 contentHash 变化 → v+1 自动发布）；DeleteSource（软删 + EnqueueJob delete → chunks/embeddings 物理清零）；**AddFeedback unsafe 联动 `UPDATE knowledge_sources SET status='quarantined'`**（重新发布=新版本天然复活，无解除逻辑）。
+  - 列表 `LEFT JOIN LATERAL` 派生索引状态（job_status/last_error/doc_status/trust_level）。
+- **前端**：`/knowledge` 页（Tabs：知识源 Dragger 上传+预览 Modal（front matter 回显 + 脱敏 Tag + 注入警告）+ 列表（索引状态列：Spin 索引中 vN/红字失败/已索引·T2·vN/已隔离）+ 编辑（加载原文回显，已发布源二次确认"保存并发布新版本"）+ 发布/删除；评测集（CRUD + enabled Switch + useful 下拉 + CLI 指引 Card）；检索状态（Documents 统计 + 向量/积压/失败））；navItems 加「知识库」（BookOutlined）。
+- **e2e（2026-08-10，:8081 RAG 全功能）**：knowledge-status 三态（未解决全 false→解决未结案→结案 indexed+T3；rejected 不建文档）；runbook 预览（front matter 解析 + secret 检测 ×1）→ 发布 → job succeeded + doc active **T2** → rag/status documents 分布（runbook:1）→ golden 创建 → `cmd/rag-eval -list`/评测（**AnyHitRate 100%**）/调参对比（topk 6→10 baseline diff 全 0% 差异）；**顺带修复既有 bug：LoadIndexMeta 的 atttypmod 列无法映射到 Dimension 字段**（GORM 列名映射——服务端靠"0 跳过维度检查"掩盖，CLI 反推 mock 时暴露）→ SQL 改 `AS dimension`。
+- **踩坑记录**：① **Go 源码中文字符串里混入 U+FEFF 字面量导致 "invalid BOM in the middle of the file"**（Edit 工具/编辑器粘贴引入）——perl/python 字节级替换为 `\uFEFF` 转义，教训：源码字符串用转义而非字面 BOM；② Raw().Scan 无行时 err==nil（不是 ErrRecordNotFound）——count/主键非空判定；③ seedIncident 建的是 resolved 事故且自带 resolution 行（测试初始态要手动插 open 事故）；④ CLI 与 server 进程 env 独立（embedding 装配不可见）——LoadIndexMeta 反推。
+- **已知限制**：个人 runbook 首期为 T2（T3 留"人工复核"流程后续）；front matter 非白名单字段忽略（不报错）；评测 CLI 与 server 共享同一 DB（评测是只读检索，无写路径）。
+
+---
+
+### Phase 8b — 基础设施指标（监控平板数据源）✅（2026-08-10）
+
+用户要求参考成熟监控平板（Grafana/Netdata 风格）展示"项目 CPU 占用、中间件使用"。新增 `internal/infra` 包 + `GET /api/v1/infra/metrics`（所有已认证租户可见，实时采集无持久化）：
+
+- **主机**（`host_windows.go`/`host_linux.go`/`host_other.go`，build tag 分平台）：系统 CPU（GetSystemTimes 两次采样差，Windows）/（/proc/stat，Linux）、内存（GlobalMemoryStatusEx / /proc/meminfo）、进程 CPU（GetProcessTimes / /proc/self/stat）、Go 堆/goroutine、磁盘剩余（GetDiskFreeSpaceExW）、进程 uptime。**首次采样 CPU 为 0（需两次采样差）**，前端 30s 轮询自然补齐。
+- **PostgreSQL**（`collectPG`）：单条 SQL 查 pg_stat_activity（连接数/活跃查询）、pg_stat_database（提交/回滚/死锁/缓存命中率）、pg_database_size、max_connections。
+- **docker 容器**（`collectDocker`）：`docker stats --no-stream --format '{{json .}}'` 单次快照解析（CPU%/MEM%/MemUsage/PIDs）；docker CLI 不可用降级空列表。实测捕获 aiops-postgres + ecommerce-mysql 两个容器。
+- **采样历史**：Service 环形缓冲 60 点（端点调用时采样），前端画 CPU 趋势小柱图。
+- **前端**：`/wallboard` 新增基础设施区（主机 CPU/内存进度条 + CPU 趋势 + PG 连接占比着色/缓存命中/库大小 + 容器 CPU/MEM 双条）；`/overview` 系统健康行补主机/PG/容器摘要。
+- **踩坑**：① 无 body 的函数声明不合法（platform 实现直接删声明）；② `windows.Handle` 传 Call 需显式 `uintptr()`；③ **Go 结构体 JSON 序列化默认用字段名**（漏写 json tag → 前端 camelCase 不匹配）——新增 DTO 结构体必须写 tag。
+- **已知限制**：CPU 采样需两次调用才有值（首次 0）；容器指标依赖 docker CLI（容器化部署自身时不可用，文档说明）；无历史持久化（环形缓冲 60 点，重启清零）。
+
+---
+
+### Phase 8c — Embedding 配置去入口化（model_configs 只留 chat，embedding 仅 env）✅（2026-08-10）
+
+用户决定 embedding 不做 UI/DB 配置入口，改由后端 env 直接配置（已确认粒度：env 全量配置，不写死代码常量）。
+
+- **`internal/modelcfg` 收敛为 chat-only**：删 `KeyEmbedding`/`KindEmbedding` 常量、`ModelConfig`/DTO/SaveInput 的 `Dimension`/`BatchSize` 字段、`ValidateSave` embedding 分支、`EnsureDefaults` embedding 种子、`List` 补位行、`Test` embedding 分支（`/embeddings` 连通性测试）、`ResolveEmbedding`；**`EffectiveEmbedding` 改为纯 env 映射**（`EffectiveEmbedding(env EmbeddingEnv)`，Enabled = driver=openai-compat 且 apiKey 非空——与 chat 门控对齐）。
+- **装配直读 env**（main.go 4.7 / rag-eval）：`ResolveEmbedding`+fail-open 两行 → `modelcfg.EffectiveEmbedding(embEnv)` 一行；二次校验/EnsureSchema/provider switch/rag.Options 原样保留；错误文案指向 `AIOPS_EMBEDDING*`。
+- **前端**：模型配置页删 embedding 条目与 dimension/batchSize 字段（保留 chat 行：超时秒+流式）；api.ts `ModelConfig`/`ModelConfigSave` 类型同步。
+- **测试**：`TestEffectiveEmbedding` 改纯 env 用例（local 透传/openai-compat+key/空 key 不启用/off）；`TestTestConnectivity` 删 embedding 分支（mock 仅 chat/completions）；List 断言 1 行。
+- **已知限制**：存量 `model_configs` 的 embedding 行成为死行（新代码不再读取，未删除——数据保守）；`model_configs` 表仍在备份校验表（chat 行）；embedding 配置修改后需重启后端生效（无热重载）。
+
+---
+
+### Phase 8d — 对话式 Agent：AI 助手（AGENT_CHAT_PLAN Phase 0+1 只读 MVP）✅（2026-08-10）
+
+按根目录 `AGENT_CHAT_PLAN.md`（设计草案）实施首批切片。用户确认：范围 = Phase 0+1 只读 MVP（§17 推荐）、生成模型 mock 先行、默认 `AIOPS_ASSISTANTENABLED=false` 功能关闭。
+
+- **`internal/llm` 新包**（纯 stdlib，不动 `internal/ai/llm.go` 兼容 facade）：通用 messages 数组 + tools/tool_calls（**arguments 按 index 跨 chunk 碎片拼接**）+ finish_reason/usage + 流式 onDelta 回调；SSE 行扫描/超时语义照抄 ai.Client；9 个 httptest 单测（含碎片拼接/并行多调用/流中超时/ctx 取消）。
+- **`internal/assistant` 新包**（6 张表：threads/messages/runs/steps/action_requests(仅 schema)/events）：
+  - `repository.go`：**SKIP LOCKED 租约领取**（2min 复活/8 次退避→dead/幂等入队 `(tenant,idempotency_key)` 冲突复用既有 run）+ **ClaimRuns 租户过滤参数**（生产传空=全租户；测试隔离与多租户 worker 分流）。
+  - `runner.go`：Agent loop（模型回合→工具执行→结果回喂），硬限制（8 回合/12 工具/60s/3s），**未知工具与非法参数拒绝执行不 panic**，nil 模型快速失败 `model_not_configured`（不重试）；独立信号量 + DB 租约（**不复用 queue.NewMemoryQueue**，不挤占告警热路径）。
+  - `stream.go`：run 级事件（DB 持久化 + 内存 fanout）——**sequence 由 SQL 原子分配**（`INSERT...SELECT COALESCE(MAX,0)+1 ... RETURNING`，底层 sql.DB `$n` 占位符——pgx stdlib 对 `?::jsonb` 转换不可靠）；断线按 lastSequence DB 快照续传。
+  - `tools_read.go`：6 个只读工具（overview/list_alerts/get_alert/list_incidents/get_incident 四节点摘要/get_topology_impact），全部 schema 白名单校验 + limit 钳制 + 结果裁剪 ≤8KB + 审计 `assistant.tool.executed`；**工具结果视为不可信数据**（防提示注入）。
+  - `service.go`：SendMessage **单事务「插消息 + 入队 run」幂等**（Idempotency-Key 头必填）；线程消息列表端点。
+- **API**：8 端点（threads CRUD/消息/run/events SSE/cancel）；**全仓第一个出站 SSE**——handler 内 `ResponseController.SetWriteDeadline(time.Time{})` 清 deadline（全局 WriteTimeout=30s 不豁免，对齐 WS 先例）；快照含 run 终态事件时立即关闭（修复：初版只在实时分支判断导致连接挂死）。
+- **装配**（main.go 4.8/4.9）：overview 服务提前创建（assistant 工具与 /overview 共用）；assistant 段 = ResolveAssistant（modelcfg 新 key `assistant_chat`，DB 行/模型配置页第三行可管理，env 首启种子）→ `assistant.ChatModel` 接口（typed-nil 防护）→ metrics（7 个 `aiops_assistant_*`）→ runner worker；NewServer 追加 2 位置参数。
+- **前端**：`/assistant` 两栏页（会话列表 + 对话区）+ 5 组件（ThreadList/ChatTimeline+MessageBubble/Composer/RunStatus/ToolStepCard）；**`useRunStream` 用 fetch+ReadableStream 手工解析 SSE**（EventSource 无法带 X-API-Key 头）；`streamReducer` 按 (runId,sequence) 去重 + delta 合并；react-markdown 懒加载；api.ts 导出 req + assistant 类型。
+- **deploy/mock_llm.mjs 扩展**：tool_calls 响应/跨 chunk 碎片/role=tool 回填编排（告警→list_alerts、事故→两步、拓扑/总览）；场景参数 multi-tool/split-args/stall/duplicate/error/retry。
+- **配置**（config.go 15 字段）：`AIOPS_ASSISTANT{ENABLED,READONLY,MAXCONCURRENCY,MAXMODELROUNDS,MAXTOOLCALLS,RUNTIMEOUTSEC,TOOLTIMEOUTSEC,RETENTIONDAYS,PROMPTVERSION}` + `ASSISTANTCHAT{DRIVER,BASEURL,APIKEY,MODEL,TIMEOUTSEC,STREAM}`；**不做契约强制**（mock 先行：未配置服务照常启动）。
+- **踩坑记录**：① `db.Raw(...).Error` 是字段访问不执行语句（必须 `.Exec`）——EnqueueRun 初版 INSERT 从未执行；② `Raw().Scan` 对 INSERT 不解析返回行（需 `Row().Scan` + **RETURNING 子句**）；③ pgx stdlib 对 `?::jsonb`/`CAST(? AS jsonb)` 的占位符转换不可靠（报 syntax error）——底层 sql.DB 用 `$n`；④ GORM uniqueIndex 需要所有参与字段声明同一索引名（TenantID 漏声明 → 索引缺列）；⑤ 测试租户不一致导致幂等命中残留（cleanup 与请求租户必须一致）；⑥ ClaimRuns 全局领取在跨包并行测试互抢——加租户过滤参数。
+- **e2e（2026-08-10，mock LLM）**：thread 创建 → 消息 202 → run completed（list_alerts 工具 ok，**最终回答事实一致**引用 3 条 critical 告警）→ SSE 事件序列完整（run.started→tool.*→message.delta×N→run.completed，0.0s 关闭）→ 幂等同 key 同 runId → cancel 生效；`go test ./...` 全绿 + `npm run build` 通过；`AIOPS_ASSISTANTENABLED=false` 时 8 端点 404（单测覆盖）。
+- **已知限制**：工具结果/参数摘要存 steps 可能含敏感串（模型 key 不会——参数经 schema 白名单）；RetentionDays 本期只存配置不执行（Phase 4）；无动作工具（Phase 3）；`assistant_events` 无清理策略（随 retention 一并做）。
+
+### Phase 9 — 对话式 Agent 阶段二：事故诊断与 RAG 引用 ✅（2026-08-10）
+
+按 AGENT_CHAT_PLAN Phase 2 实施（IncidentDetail 上下文入口 / 3 个知识工具 / 引用卡 / 反馈 / 历史压缩）。RAG 关闭时知识工具不注册（聊天仍可用领域只读工具），向量路失败自动关键词降级透出。
+
+- **`rag.SearchKnowledge`**（rag/search.go）：通用知识检索入口——自由文本 → `RetrievalQuery` → 复用三路召回/融合/预算；查询脱敏沿用 recallVector 内 Sanitize fail-closed（疑似密钥→跳过向量路降级关键词）；`KnowledgeSearchFilters{Service,Limit}`；空查询返回空包不报错。
+- **3 个新工具**（assistant/tools_knowledge.go，依赖缺失不注册）：
+  - `search_knowledge`（query 必填/service/limit）：通用知识检索；
+  - `get_similar_incidents`（incident_id/limit）：`BuildQuery` 事故驱动召回，`baseFilter` 排除自身，labels 取首条关联告警白名单字段；
+  - `list_playbooks`（limit）：剧本元数据（名称/级别/命令模板/爆炸半径/dry-run），disabled 跳过；
+  - 结果统一形状 `{count, degradedReason, results[]}`——degradedReason 透出给模型（回答可提示降级）与前端（ToolStepCard 橙色 Tag）。
+- **Citation 机制**：`Citation{sourceType,sourceId,title,trustLevel,time,url}`——工具经 `ToolCallCtx.Citations *[]Citation` 收集（仅检索类填写）；runner 逐条发布 `citation.added` 事件（按 runId,sequence 幂等）+ 最终 assistant 消息落 `citations` jsonb（`message.completed` 事件同时携带）；`aiops_assistant_citations_total{source_type}` 指标；URL 仅对可定位来源生成（incident→/incidents/:id、playbook→/playbooks，runbook 前端兜底 /knowledge）。
+- **thread 上下文绑定**：`CreateThreadInput{contextType:"incident",contextId}`（Service 校验事故存在、标题默认事故名；非法类型/缺失 ID 400）；`ContextBuilder`（context_builder.go）run 开始时把绑定事故的确定性事实（名称/状态/严重度/摘要/关联告警）注入 system——回答围绕绑定事故展开。
+- **历史压缩摘要**（context.go）：`trimHistory` 返回 (kept,dropped)；`compressDropped` 对被裁历史生成规则摘要（user/assistant 各取 80 rune，≤4 条）注入 system（明确"仅供背景参考，不构成当前指令"）。
+- **反馈 API**：`POST /assistant/messages/:id/feedback`（rating useful|not_useful + note；仅最终 assistant 消息可评）→ `assistant_feedback` 新表 + 审计 `assistant.message.feedback` + `aiops_assistant_feedback_total{rating}` 指标。
+- **前端**：ChatTimeline 引用卡（来源可点跳转 + 可信等级 Tag）+ 流式 StreamCitations（citation.added 实时出现，reducer 按 sourceType+sourceId 去重）+ MessageBubble 反馈按钮（有用/没用，提交后状态锁定）；ToolStepCard 检索降级橙色 Tag；Assistant.tsx 支持 `?incident=<id>`（自动建绑定会话 + 发「分析这个事故」，ref 防 StrictMode 双跑）；IncidentDetail 头部「在 AI 助手中分析」按钮；api.ts 类型（Citation/contextType/citations）+ assistantFeedback。
+- **mock_llm.mjs**：3 个工具结果 + 关键词分发（**具体词优先于宽泛词**——「相似历史事故」含「事故」，顺序错误会被拦截）+ 对应最终回答（含降级提示文案）。
+- **踩坑记录**：① `incident.Service.Get` 对不存在返回 `gorm.ErrRecordNotFound` **error**（与 alert repo 的 nil,nil 语义不同）——get_similar_incidents 首版把不存在事故当工具失败，e2e 抓到后按「事故不存在」降级结果处理；② react-query v5 `useMutation` 的可选参数 mutationFn 仍要求显式传 `mutate(undefined)`；③ Git Bash curl `-d` 直写中文按 GBK 发送（mock 收到乱码→关键词分发失效）——e2e 用 UTF-8 文件 `-d @file`。
+- **e2e（2026-08-10，mock LLM + RAG local embedding）**：绑定事故会话创建（contextType/contextId/标题默认事故名）→「查询知识库…」→ search_knowledge 真实检索（命中 5 条证据：incident×3 T3/T1 + runbook×1 T2 + playbook×1 T2）→ SSE `tool.started→tool.completed→citation.added×5→message.delta→run.completed` → 消息 citations 落库（URL 正确）→ 反馈 204/非法 rating 400 → metrics 计数正确；get_similar_incidents 与 list_playbooks 各自工具链路全通；`go test ./...` 30 包全绿 + `npm run build` 通过。
+- **已知限制**：citation 为「run 内所有工具命中的证据」全集（未按最终回答实际引用过滤——引用精度评测留待 Phase 4 离线问题集）；`assistant_feedback` 无独立保留策略（随 Phase 4 retention 一并做）；runbook 来源无固定前端路由（引用卡跳 /knowledge）。
 
 ---
 
@@ -485,6 +670,8 @@ cd web && npm run build                                    # tsc + vite build �
 | ~~**规模化**~~（✅ 已交付，Phase 3） | Postgres 加固、拓扑影响面（SQL 递归 CTE）、万级压测（10 倍余量达标）；Neo4j 后置仅替换 Impact 查询 | 全局 |
 | ~~**规模化延伸**~~（✅ 已交付，Phase 3b/3c/3d） | alerts 月分区 + 保留 DROP、CTE 单语句写入、规则引擎规则缓存、dedup 2 读合并（last_alerts 冗余 alert_hash）；批量写（D2）扫描论证后降级 | 全局 |
 | **规模化下一步**（候选） | ~~生产 HTTP 超时按规格调优~~（✅ Phase 3e）~~loadgen 接入 CI 回归基准~~（✅ Phase 3f，`make bench/regress/regress-baseline`）~~`SaveAlerts` 批量写（批内 overlay）~~（✅ Phase 3g，`make bench-batch/regress-batch/regress-baseline-batch`，batch20 请求延迟 973→197ms） | 全局 |
+| ~~**RAG 知识检索**~~（✅ 已交付，Phase 4 首期） | 结案数据契约 + pgvector 知识底座 + 持久化索引 worker + 相似事故只读（RAG_PLAN.md Phase 0~2，默认关闭） | rag + embedding + incident + playbook + api + web |
+| **RAG 后续阶段**（候选） | Phase 3 RCA Shadow（EvidencePack 注入 RCAAgent + 引用校验 + Shadow 对照）→ Phase 4 assist（Playbook 稳定 ID 映射）→ Phase 5 文档治理（Runbook 上传/reranker/索引分区）；按 RAG_PLAN.md §17 上线门禁推进 | rag + agent + ai + web |
 
 基准报告见 **docs/PERF.md**（根因链/修复清单/服务端观测/建议）。
 

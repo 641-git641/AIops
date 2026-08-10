@@ -21,9 +21,10 @@
 12. [YAML 工作流引擎](#12-yaml-工作流引擎)
 13. [服务拓扑与影响面](#13-服务拓扑与影响面)
 14. [存储规模化设计](#14-存储规模化设计)
-15. [指标与压测](#15-指标与压测)
-16. [部署与运维](#16-部署与运维)
-17. [常见问题与踩坑记录](#17-常见问题与踩坑记录)
+15. [AI 助手（对话式 Agent）](#15-ai-助手对话式-agent)
+16. [指标与压测](#16-指标与压测)
+17. [部署与运维](#17-部署与运维)
+18. [常见问题与踩坑记录](#18-常见问题与踩坑记录)
 
 > 不懂某个术语/缩写？先查 [GLOSSARY.md](GLOSSARY.md)（运维概念与黑话入门，面向新手逐条大白话解释）。
 
@@ -138,11 +139,24 @@ deploy/            docker-compose（PostgreSQL）+ mock_webhook/mock_llm/mock_ec
 | `maintenance_windows` | id, name, fingerprint, service, severity, starts_at, ends_at, enabled, reason | 至少一个匹配条件 | 维护窗口静默 |
 | `workflows` | id, name, yaml(text), enabled | 原始 YAML 存储，触发时解析 | 工作流定义 |
 | `workflow_runs` | id, workflow_id, dedup_key, trigger(alert/interval/manual), status, result(jsonb), error, started_at, finished_at | **唯一 `(tenant_id, workflow_id, dedup_key)`** | 并发防重 + 运行记录 |
+| `incident_resolutions` | id, tenant_id, incident_id, confirmed_root_cause, resolution, outcome(success/partial/failed/false_positive), verification, verification_status(verified/unverified/rejected), postmortem_url, resolved_by, resolved_at, version | **唯一 `(tenant_id, incident_id)`**；version 每次更新 +1（知识索引 source_version）；verified 必填根因与处置 | 结案数据契约（RAG 知识来源） |
+| `knowledge_documents` | id, tenant_id, source_type(incident/playbook/...), source_id, source_version, title, body, service, severity, trust_level(T0-T3), verification_status, status(active/superseded/deleted/failed/quarantined), valid_from/valid_until, checksum, metadata(jsonb) | **唯一 `(tenant_id, source_type, source_id, source_version)`**；查询只取 active+未过期+非 rejected；GIN(metadata) | 知识源文档（规范化快照，版本演进） |
+| `knowledge_chunks` | id, tenant_id, document_id, ordinal, section, content, token_count, content_tsv(tsvector), checksum, metadata(jsonb) | **唯一 `(document_id, ordinal, checksum)`**；GIN(content_tsv) + GIN(content gin_trgm_ops) | 知识切片（语义边界，不截断标识符） |
+| `knowledge_embeddings` | id, tenant_id, chunk_id, model_id, index_version, embedding(vector(D)), created_at | **唯一 `(chunk_id, model_id, index_version)`**；向量列/扩展由显式 SQL migration（rag.EnsureSchema）管理 | 向量（模型/维度变更须换 index_version 重建） |
+| `knowledge_jobs` | id, tenant_id, operation(upsert/delete/rebuild), source_type, source_id, source_version, status(pending/running/succeeded/failed/dead), attempts, next_run_at, last_error, locked_at/locked_by | **唯一 `(tenant_id, source_type, source_id, source_version, operation)`**；SKIP LOCKED 领取、2min 租约、8 次退避上限进 dead | 持久化索引任务（非内存队列） |
+| `rag_traces` | id, tenant_id, incident_id, query_hash, retrieval_version, index_version, candidate_ids/selected_ids(jsonb), latency_ms(jsonb), degraded_reason | 每次相似检索落一条（调试/审计） | 检索轨迹 |
+| `rag_feedback` | id, tenant_id, incident_id, trace_id, document_id, rating(useful/not_useful/wrong/unsafe), corrected_root_cause, actor | unsafe → 文档立即 quarantine 退出召回 | 人工反馈（不改索引内容） |
 | `topology_services` | id, name, kind, depends_on(jsonb), recent_changes(jsonb), impact_score | 服务拓扑节点 | RCA 事实来源 |
 | `topology_edges` | id, service, depends_on, tenant_id | 唯一 `(service, depends_on)`；依赖边归一化投影 | 影响面 SQL 递归 CTE |
 | `notification_channels` | name, enabled, webhook, ... | 渠道配置以 DB 为准（env 仅首启种子） | 通知渠道管理 |
 | `audit_logs` | actor, action, target, reason, metadata(jsonb), correlation_id | who/when/what/why | 审计轨迹 |
 | `api_keys` | name, secret_hash | 明文仅创建时返回一次 | API key 认证 |
+| `assistant_threads` | id, tenant_id, title, status(active/deleted), context_type/context_id | 会话（软删；context 绑定 Phase 2） | 对话式 Agent（AGENT_CHAT_PLAN） |
+| `assistant_messages` | id, tenant_id, thread_id, run_id, role(user/assistant/tool), content, sequence, citations(jsonb) | **唯一 `(tenant_id, thread_id, sequence)`** | 会话消息（仅最终 assistant 消息作为后续上下文） |
+| `assistant_runs` | id, tenant_id, thread_id, status(queued/running/completed/failed/cancelled), model, prompt_version, idempotency_key, attempts, next_run_at, locked_at/locked_by | **唯一 `(tenant_id, idempotency_key)`**（幂等防重）；SKIP LOCKED 领取、2min 租约、8 次退避上限 | run 状态机（对齐 knowledge_jobs 租约模式） |
+| `assistant_steps` | id, run_id, ordinal, kind(model/tool_call/tool_result/policy), tool_name, arguments/result_summary(jsonb), status, duration_ms | 步骤可回放/审计；只存裁剪摘要 | 运行步骤 |
+| `assistant_events` | id, run_id, sequence, type(run.*/message.delta/tool.*/heartbeat), data(jsonb) | **唯一 `(run_id, sequence)`**；SQL 原子分配 | SSE 事件持久化（断线按 lastSequence 续传） |
+| `assistant_action_requests` | id, run_id, tool_name, arguments(jsonb), risk_level, status, idempotency_key | 本期仅建 schema（Phase 3 动作确认启用） | 需人工确认的动作请求 |
 
 **两个关键冗余设计**（都是为了去重热路径单读）：
 1. `last_alerts.alert_hash` + `status`：Phase 3d 把内容哈希与状态冗余进当前状态缓存，`Classify` 只查 `(tenant_id, fingerprint)` 唯一索引 **1 次**即可分类（不再回读 alerts 分区表）。
@@ -154,7 +168,12 @@ deploy/            docker-compose（PostgreSQL）+ mock_webhook/mock_llm/mock_ec
 
 ### 4.1 归一化（Provider 层）
 
-`POST /api/v1/webhook/:provider` → `provider.Registry.MustWebhook(kind)` 取解析器 → `Parse(body)` 产出 `[]*IngestEvent`。内置 provider：`prometheus`（Alertmanager 格式）、`log`（演示）。事件以当前租户覆盖 provider 默认租户（多租户贯穿）。
+`POST /api/v1/webhook/:provider` → `provider.Registry.MustWebhook(kind)` 取解析器 → `Parse(body)` 产出 `[]*IngestEvent`。内置 provider：`prometheus`（Alertmanager 格式）、`grafana`（Grafana Alerting webhook）、`log`（演示）。事件以当前租户覆盖 provider 默认租户（多租户贯穿）。
+
+**接入配置示例**：
+- Prometheus/Alertmanager：`alertmanager.yml` 的 `receivers[].webhook_configs[].url = http://<host>:8080/api/v1/webhook/prometheus`（`send_resolved: true` 可收恢复事件）。
+- Grafana：Alerting → Contact points → 新建 webhook 联系人，URL 填 `http://<host>:8080/api/v1/webhook/grafana`；Grafana Unified Alerting 负载的 labels/annotations 归一化同 Alertmanager 语义，`generatorURL/fingerprint/values` 存入告警 Event 详情。
+- 大模型 API：Chat LLM 走前端「模型配置」页（`model_configs` 表，apiKey 只入库不回显；env 的 `AIOPS_LLM*` 仅首启种子）；**Embedding 无 UI/DB 入口**——由 `AIOPS_EMBEDDING*` env 直接配置（示例见 README 配置表千问块）。均**保存/修改后重启后端生效**；管理端点需 `AIOPS_MODELCFGADMINAPIS=true`（默认 403）。
 
 `IngestEvent` 关键字段：`TenantID / Provider / Name / Severity / Status / Labels / Event / StartedAt`。
 
@@ -433,9 +452,46 @@ workflow:
 
 ---
 
-## 15. 指标与压测
+## 15. AI 助手（对话式 Agent，AGENT_CHAT_PLAN Phase 0+1 只读 MVP）
 
-### 15.1 Prometheus 指标（`GET /metrics`）
+> 设计草案与阶段计划见根目录 `AGENT_CHAT_PLAN.md`；本阶段 = 只读运维副驾驶（无动作工具、无 RAG 引用）。
+
+### 15.1 功能范围
+
+- **会话**：新建/列表/软删；发送消息要求 `Idempotency-Key` 头（幂等防双击/断线重放）。
+- **Agent loop**：独立 DB 租约 worker（不复用告警内存队列）领取 run → 多轮「模型 → 工具调用 → 工具结果回喂」→ 最终回答落库。
+- **只读工具**（基础 6 个 + 知识 3 个，全部参数二次校验 + 结果裁剪 + 审计）：`get_platform_overview` / `list_alerts` / `get_alert` / `list_incidents` / `get_incident`（含 monitor/rca/heal/change 四节点摘要）/ `get_topology_impact`；**知识类**（Phase 2，RAG 关闭时不注册）：`search_knowledge`（知识库通用检索）/ `get_similar_incidents`（相似历史事故，排除自身）/ `list_playbooks`（剧本元数据）。
+- **引用与反馈**（Phase 2）：检索类工具命中证据 → `citation.added` 事件实时推送 + 最终回答消息落 `citations` 字段；前端引用卡可点跳转（事故/剧本/知识）；回答下方「有用/没用」反馈（`POST /messages/:id/feedback`）。
+- **上下文绑定**（Phase 2）：会话可绑定事故（`contextType: "incident"`）；事故详情页「在 AI 助手中分析」一键进入；run 自动注入绑定事故的确定性事实摘要；超长历史自动裁剪并生成早期对话摘要。
+- **流式**：`GET /runs/:id/events` 是**全仓第一个出站 SSE**（快照续传 + 实时订阅 + 15s 心跳）；SSE handler 内清除底层 deadline（全局 WriteTimeout=30s 不豁免——对齐 WS 先例）。
+- **硬限制**：单 run ≤8 模型回合 / ≤12 工具调用 / 60s 总超时 / 3s 工具超时；未知工具与非法参数**拒绝执行**并继续（不 panic、不终止 run）。
+- **安全**：工具结果与知识内容视为不可信数据（防提示注入，疑似密钥的查询不送向量服务）；run/步骤/事件全 tenant 强制；审计 `assistant.*` 动作（Actor 本期 `local-noauth`）。
+
+### 15.2 启用与配置
+
+```bash
+# mock 联调（无需 key）
+node deploy/mock_llm.mjs 9999
+AIOPS_ASSISTANTENABLED=true \
+AIOPS_ASSISTANTCHATBASEURL=http://localhost:9998 \
+AIOPS_ASSISTANTCHATAPIKEY=dummy AIOPS_ASSISTANTCHATMODEL=mock \
+go run ./cmd/aiops
+```
+
+- 生成模型要求 OpenAI 兼容且支持 tool calling（qwen-plus / deepseek-chat 均可）；模型配置页「Assistant Chat」行可管理（env 仅首启种子）。
+- 未配置模型时服务照常启动，run 快速失败 `model_not_configured`（不重试）；`AIOPS_ASSISTANTENABLED=false` 时全部 `/assistant` 端点 404，现有路径零变化。
+- **知识类工具需要 RAG 开启**（`AIOPS_RAGENABLED=true` + embedding 配置，见 §14）：RAG 关闭时 `search_knowledge`/`get_similar_incidents` 不注册（工具列表不出现），聊天仍可用领域只读工具；向量路失败自动关键词降级，回答与工具卡均透出降级原因。
+- 数据表 7 张（threads/messages/runs/steps/events/action_requests + **feedback**，见 §3 数据模型表），`assistant_events` 的 sequence 由 SQL 原子分配（重启安全）。
+
+### 15.3 指标（`/metrics`）
+
+`aiops_assistant_runs_total{status,model}`、`aiops_assistant_run_duration_seconds`、`aiops_assistant_model_duration_seconds`、`aiops_assistant_tool_calls_total{tool,outcome}`、`aiops_assistant_tool_duration_seconds`、`aiops_assistant_active_runs`、`aiops_assistant_tokens_total{direction,model}`；Phase 2 新增 `aiops_assistant_citations_total{source_type}`（回答引用）与 `aiops_assistant_feedback_total{rating}`（消息反馈）。
+
+---
+
+## 16. 指标与压测
+
+### 16.1 Prometheus 指标（`GET /metrics`）
 
 | 指标 | 类型 | 说明 |
 |---|---|---|
@@ -446,7 +502,7 @@ workflow:
 | `aiops_incidents_total{source}` | 计数 | 新建事故数（rule/agent/ai） |
 | `aiops_queue_depth` | 仪表 | 任务队列深度（agent.run + workflow.trigger） |
 
-### 15.2 loadgen 压测工具（cmd/loadgen）
+### 16.2 loadgen 压测工具（cmd/loadgen）
 
 ```
 go run ./cmd/loadgen -baseurl http://127.0.0.1:8080 -rate 2000 -duration 30s \
@@ -459,7 +515,7 @@ go run ./cmd/loadgen -baseurl http://127.0.0.1:8080 -rate 2000 -duration 30s \
 - `-summary` 写出机器可读 JSON 汇总（含 profile：rate/duration/concurrency/variety/batch/severity + 吞吐/P50-P95/P99/失败率）。
 - `-compare <baseline>` 回归判定：吞吐 < 0.8× 或 P50/P99 > 1.5× 基线非零退出（`-tol-throughput` / `-tol-latency` 可调）；**profile 与基线不一致直接判失败**。
 
-### 15.3 基准结果摘要（详见 PERF.md）
+### 16.3 基准结果摘要（详见 PERF.md）
 
 | 场景 | 结果 |
 |---|---|
@@ -469,7 +525,7 @@ go run ./cmd/loadgen -baseurl http://127.0.0.1:8080 -rate 2000 -duration 30s \
 
 ---
 
-## 16. 部署与运维
+## 17. 部署与运维
 
 ### 16.1 本地启动
 
@@ -503,7 +559,7 @@ make web     # cd web && npm run dev（:5173）
 
 ---
 
-## 17. 常见问题与踩坑记录
+## 18. 常见问题与踩坑记录
 
 **去重与状态**
 - `last_alerts` 是当前状态真源（保留策略不清除）；alerts 历史行被删后仍正确判 duplicate。
