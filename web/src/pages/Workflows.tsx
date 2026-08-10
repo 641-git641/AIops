@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Table, Tag, Button, Space, Card, Modal, Form, Input, Switch, Popconfirm, message } from 'antd'
+import { Table, Tag, Button, Space, Card, Modal, Form, Input, Switch, Popconfirm, message, Empty } from 'antd'
 import { PlusOutlined, PlayCircleOutlined } from '@ant-design/icons'
 import { api, type Workflow, type WorkflowRun } from '../api'
 
@@ -106,6 +106,7 @@ export default function Workflows() {
           loading={isLoading}
           dataSource={data?.items ?? []}
           pagination={false}
+          locale={{ emptyText: <Empty description="还没有工作流。点击「新建工作流」用 YAML 定义告警触发的自动化处置（模板已预填）" /> }}
           columns={[
             {
               title: '名称', dataIndex: 'name',
