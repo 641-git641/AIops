@@ -1,12 +1,12 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
-  Alert, Button, Card, Descriptions, Input, Modal, Popconfirm, Space, Table, Tabs, Tag,
-  Typography, message,
+  Alert, Button, Card, Descriptions, Form, Input, InputNumber, Modal, Popconfirm, Select, Space,
+  Switch, Table, Tabs, Tag, Typography, message,
 } from 'antd'
-import { CloudUploadOutlined, KeyOutlined, ReloadOutlined } from '@ant-design/icons'
+import { CloudUploadOutlined, KeyOutlined, LinkOutlined, ReloadOutlined } from '@ant-design/icons'
 import { api } from '../api'
-import type { BackupRun, APIKeyItem } from '../api'
+import type { BackupRun, APIKeyItem, ExternalSystem } from '../api'
 
 // Settings 设置页（KEEPON M1）：数据备份 + 访问密钥 两个 Tab。
 // 备份恢复不做网页按钮——恢复是高风险操作，仅通过 scripts/restore.sh 执行。
@@ -232,6 +232,146 @@ function KeysTab() {
   )
 }
 
+// ExternalSystemsTab 外部可观测系统管理（KEEPON 6.2）：侧边栏快捷跳转。
+// 保存后立即生效（DB 为准，无需重启）；仅允许 http/https URL。
+function ExternalSystemsTab() {
+  const [msg, ctx] = message.useMessage()
+  const qc = useQueryClient()
+  const [editing, setEditing] = useState<ExternalSystem | null>(null)
+  const [modalOpen, setModalOpen] = useState(false)
+  const [form] = Form.useForm()
+
+  const { data, isLoading } = useQuery({ queryKey: ['external-systems'], queryFn: api.externalSystems })
+
+  const invalidate = () => qc.invalidateQueries({ queryKey: ['external-systems'] })
+  const save = useMutation({
+    mutationFn: (values: Partial<ExternalSystem>) =>
+      editing ? api.updateExternalSystem(editing.id, values) : api.createExternalSystem(values),
+    onSuccess: () => {
+      msg.success('已保存，侧边栏立即生效')
+      setModalOpen(false)
+      setEditing(null)
+      invalidate()
+    },
+    onError: (e: Error) => msg.error(`保存失败：${e.message}`),
+  })
+  const del = useMutation({
+    mutationFn: (id: string) => api.deleteExternalSystem(id),
+    onSuccess: () => {
+      msg.success('已删除')
+      invalidate()
+    },
+    onError: (e: Error) => msg.error(`删除失败：${e.message}`),
+  })
+
+  const typeColor: Record<string, string> = { grafana: 'orange', prometheus: 'volcano', logs: 'blue', other: 'default' }
+
+  return (
+    <Space direction="vertical" style={{ width: '100%' }} size="large">
+      <Card size="small" title="外部系统">
+        <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginBottom: 12 }}>
+          配置后出现在侧边栏「外部系统」分组，点击以新标签页打开。环境变量{' '}
+          <Typography.Text code>AIOPS_EXTERNALSYSTEMS</Typography.Text>（JSON 数组）仅首次启动播种，之后以这里为准。
+        </Typography.Paragraph>
+        <Space style={{ marginBottom: 12 }}>
+          <Button
+            type="primary" icon={<LinkOutlined />}
+            onClick={() => {
+              setEditing(null)
+              form.resetFields()
+              setModalOpen(true)
+            }}
+          >
+            新增系统
+          </Button>
+        </Space>
+        <Table<ExternalSystem>
+          rowKey="id"
+          size="small"
+          loading={isLoading}
+          dataSource={data?.items ?? []}
+          pagination={false}
+          columns={[
+            { title: '名称', dataIndex: 'name', width: 160 },
+            {
+              title: '类型', dataIndex: 'type', width: 110,
+              render: (t: string) => <Tag color={typeColor[t]}>{t}</Tag>,
+            },
+            { title: '地址', dataIndex: 'url', render: (u: string) => <Typography.Text code style={{ fontSize: 12 }}>{u}</Typography.Text> },
+            { title: '排序', dataIndex: 'sortOrder', width: 70 },
+            {
+              title: '启用', dataIndex: 'enabled', width: 80,
+              render: (e: boolean) => (e ? <Tag color="green">启用</Tag> : <Tag>停用</Tag>),
+            },
+            {
+              title: '操作', width: 130,
+              render: (_: unknown, r) => (
+                <Space size={4}>
+                  <Button
+                    size="small"
+                    onClick={() => {
+                      setEditing(r)
+                      form.setFieldsValue(r)
+                      setModalOpen(true)
+                    }}
+                  >
+                    编辑
+                  </Button>
+                  <Popconfirm title={`删除「${r.name}」？`} onConfirm={() => del.mutate(r.id)}>
+                    <Button size="small" danger>删除</Button>
+                  </Popconfirm>
+                </Space>
+              ),
+            },
+          ]}
+        />
+      </Card>
+      <Modal
+        open={modalOpen}
+        title={editing ? `编辑 ${editing.name}` : '新增外部系统'}
+        onCancel={() => setModalOpen(false)}
+        onOk={() => form.submit()}
+        confirmLoading={save.isPending}
+        destroyOnClose
+      >
+        <Form form={form} layout="vertical" onFinish={(v) => save.mutate(v)} initialValues={{ type: 'grafana', enabled: true, sortOrder: 0 }}>
+          <Form.Item name="name" label="名称" rules={[{ required: true, message: '请输入名称' }]}>
+            <Input placeholder="如 Grafana / Prometheus / 日志系统" />
+          </Form.Item>
+          <Form.Item
+            name="url" label="地址"
+            rules={[
+              { required: true, message: '请输入 URL' },
+              { pattern: /^https?:\/\/.+/i, message: '仅支持 http/https 地址' },
+            ]}
+          >
+            <Input placeholder="https://grafana.example.com" />
+          </Form.Item>
+          <Form.Item name="type" label="类型" rules={[{ required: true }]}>
+            <Select
+              options={[
+                { value: 'grafana', label: 'Grafana' },
+                { value: 'prometheus', label: 'Prometheus' },
+                { value: 'logs', label: '日志' },
+                { value: 'other', label: '其他' },
+              ]}
+            />
+          </Form.Item>
+          <Space size="large">
+            <Form.Item name="enabled" label="启用" valuePropName="checked">
+              <Switch />
+            </Form.Item>
+            <Form.Item name="sortOrder" label="排序（小在前）">
+              <InputNumber min={0} max={99} />
+            </Form.Item>
+          </Space>
+        </Form>
+      </Modal>
+      {ctx}
+    </Space>
+  )
+}
+
 export default function Settings() {
   return (
     <Tabs
@@ -239,6 +379,7 @@ export default function Settings() {
       items={[
         { key: 'backup', label: '数据备份', children: <BackupTab /> },
         { key: 'keys', label: '访问密钥', children: <KeysTab /> },
+        { key: 'external', label: '外部系统', children: <ExternalSystemsTab /> },
       ]}
     />
   )

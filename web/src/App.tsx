@@ -9,6 +9,7 @@ import {
   DashboardOutlined,
   FileDoneOutlined,
   HomeOutlined,
+  LinkOutlined,
   NodeIndexOutlined,
   NotificationOutlined,
   RobotOutlined,
@@ -68,6 +69,31 @@ function MainLayout() {
   const location = useLocation()
   if (location.pathname === '/wallboard') return <Wallboard />
 
+  // 外部可观测系统（KEEPON 6.2）：enabled 条目进侧边栏分组，新标签页打开（noopener 防反向标签）
+  const { data: extData } = useQuery({
+    queryKey: ['external-systems'],
+    queryFn: api.externalSystems,
+    retry: false,
+    staleTime: 60_000,
+  })
+  const externalItems = (extData?.items ?? [])
+    .filter((s) => s.enabled)
+    .map((s) => ({
+      key: `ext:${s.id}`,
+      icon: <LinkOutlined />,
+      label: (
+        <span
+          onClick={() => window.open(s.url, '_blank', 'noopener,noreferrer')}
+          style={{ cursor: 'pointer' }}
+        >
+          {s.name}
+        </span>
+      ),
+    }))
+  const menuItems = externalItems.length > 0
+    ? [...navItems, { type: 'group' as const, label: '外部系统', children: externalItems }]
+    : navItems
+
   return (
     <Layout style={{ minHeight: '100vh' }}>
       <Sider theme="dark" width={200}>
@@ -78,7 +104,7 @@ function MainLayout() {
           theme="dark"
           mode="inline"
           selectedKeys={[location.pathname]}
-          items={navItems}
+          items={menuItems}
         />
       </Sider>
       <Layout>
