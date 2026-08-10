@@ -35,7 +35,7 @@ func rcaAlert(t *testing.T) *alert.Alert {
 }
 
 func TestRCAAgentWithoutLLMNoEnhancement(t *testing.T) {
-	r := NewRCAAgent(nil, nil)
+	r := NewRCAAgent(nil, nil, nil) // ev nil：行为不变
 	a := &alert.Alert{
 		ID: "alert-1", Name: "order-slow", Severity: alert.SeverityMedium,
 		Labels: mustJSON(t, map[string]any{"severity": "medium"}), // 无 service → service_not_found 分支，不触 topo

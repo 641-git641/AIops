@@ -119,3 +119,112 @@ func TestLoadStorageHardeningEnv(t *testing.T) {
 		t.Errorf("RetentionIntervalMin = %d, want 5", cfg.RetentionIntervalMin)
 	}
 }
+
+func TestLoadAssistantDefaultsAndEnv(t *testing.T) {
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load error = %v", err)
+	}
+	if cfg.AssistantEnabled {
+		t.Error("AssistantEnabled = true, want false（默认关闭）")
+	}
+	if !cfg.AssistantReadOnly {
+		t.Error("AssistantReadOnly = false, want true")
+	}
+	if cfg.AssistantMaxConcurrency != 4 || cfg.AssistantMaxModelRounds != 8 ||
+		cfg.AssistantMaxToolCalls != 12 || cfg.AssistantRunTimeoutSec != 60 ||
+		cfg.AssistantToolTimeoutSec != 3 || cfg.AssistantRetentionDays != 90 {
+		t.Errorf("assistant limits = %d/%d/%d/%d/%d/%d，want 4/8/12/60/3/90",
+			cfg.AssistantMaxConcurrency, cfg.AssistantMaxModelRounds, cfg.AssistantMaxToolCalls,
+			cfg.AssistantRunTimeoutSec, cfg.AssistantToolTimeoutSec, cfg.AssistantRetentionDays)
+	}
+	if cfg.AssistantPromptVersion != "v1" {
+		t.Errorf("AssistantPromptVersion = %q, want v1", cfg.AssistantPromptVersion)
+	}
+	if cfg.AssistantChatDriver != "openai-compat" || cfg.AssistantChatTimeoutSec != 15 || !cfg.AssistantChatStream {
+		t.Errorf("assistant chat defaults = %q/%d/%v", cfg.AssistantChatDriver, cfg.AssistantChatTimeoutSec, cfg.AssistantChatStream)
+	}
+
+	t.Setenv("AIOPS_ASSISTANTENABLED", "true")
+	t.Setenv("AIOPS_ASSISTANTCHATBASEURL", "http://localhost:9998")
+	t.Setenv("AIOPS_ASSISTANTCHATAPIKEY", "sk-test")
+	t.Setenv("AIOPS_ASSISTANTCHATMODEL", "mock-chat")
+	t.Setenv("AIOPS_ASSISTANTMAXMODELROUNDS", "20")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load error = %v", err)
+	}
+	if !cfg.AssistantEnabled || cfg.AssistantChatBaseURL != "http://localhost:9998" ||
+		cfg.AssistantChatAPIKey != "sk-test" || cfg.AssistantChatModel != "mock-chat" {
+		t.Errorf("assistant env 未生效: %+v", cfg.AssistantChatBaseURL)
+	}
+	if cfg.AssistantMaxModelRounds != 20 {
+		t.Errorf("AssistantMaxModelRounds = %d, want 20", cfg.AssistantMaxModelRounds)
+	}
+	// 越界回填
+	t.Setenv("AIOPS_ASSISTANTMAXTOOLCALLS", "9999")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load error = %v", err)
+	}
+	if cfg.AssistantMaxToolCalls != 12 {
+		t.Errorf("AssistantMaxToolCalls 越界未回填 = %d, want 12", cfg.AssistantMaxToolCalls)
+	}
+}
+
+func TestLoadEvidenceDefaultsAndEnv(t *testing.T) {
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load error = %v", err)
+	}
+	if cfg.EvidenceEnabled {
+		t.Error("EvidenceEnabled = true, want false（默认关闭）")
+	}
+	if cfg.EvidenceTimeoutSec != 3 {
+		t.Errorf("EvidenceTimeoutSec = %d, want 3", cfg.EvidenceTimeoutSec)
+	}
+	if cfg.PrometheusURL != "" || cfg.LokiURL != "" {
+		t.Error("数据源 URL 默认应为空")
+	}
+
+	t.Setenv("AIOPS_EVIDENCEENABLED", "true")
+	t.Setenv("AIOPS_PROMETHEUSURL", "http://localhost:9090")
+	t.Setenv("AIOPS_LOKIURL", "http://localhost:3100")
+	t.Setenv("AIOPS_PROMETHEUSQUERIES", "rate(x[5m]); container_cpu_usage_seconds_total{service=\"%s\"}")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load error = %v", err)
+	}
+	if !cfg.EvidenceEnabled || cfg.PrometheusURL != "http://localhost:9090" ||
+		cfg.LokiURL != "http://localhost:3100" {
+		t.Errorf("evidence env 未生效: %+v", cfg.EvidenceEnabled)
+	}
+	if cfg.PrometheusQueries == "" {
+		t.Error("PrometheusQueries 未生效")
+	}
+	// 契约错误：enabled 但无任何 URL → 报错
+	t.Setenv("AIOPS_PROMETHEUSURL", "")
+	t.Setenv("AIOPS_LOKIURL", "")
+	if _, err := Load(); err == nil {
+		t.Fatal("EvidenceEnabled 无 URL 应报错")
+	}
+}
+
+func TestLoadModelCfgAdminDefaultsAndEnv(t *testing.T) {
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ModelCfgAdminAPIs || cfg.ModelCfgAdminTenants != "" {
+		t.Fatalf("modelcfg admin defaults: %v %q", cfg.ModelCfgAdminAPIs, cfg.ModelCfgAdminTenants)
+	}
+	t.Setenv("AIOPS_MODELCFGADMINAPIS", "true")
+	t.Setenv("AIOPS_MODELCFGADMINTENANTS", "ops,dev")
+	cfg2, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg2.ModelCfgAdminAPIs || cfg2.ModelCfgAdminTenants != "ops,dev" {
+		t.Fatalf("modelcfg admin env: %v %q", cfg2.ModelCfgAdminAPIs, cfg2.ModelCfgAdminTenants)
+	}
+}

@@ -204,7 +204,9 @@ func mustJSON(v any) datatypes.JSON {
 	return datatypes.JSON(b)
 }
 
-func normalizeSeverity(s string) string {
+// NormalizeSeverity 归一化严重度别名（p0/severe→critical、error→high、warning/warn→medium、
+// notice→info；未知默认 medium）。导出供 generic provider 白名单校验与回显共用（避免映射漂移）。
+func NormalizeSeverity(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
 	switch s {
 	case SeverityCritical, SeverityHigh, SeverityMedium, SeverityLow, SeverityInfo:
@@ -222,7 +224,9 @@ func normalizeSeverity(s string) string {
 	return SeverityMedium
 }
 
-func normalizeStatus(s string) string {
+// NormalizeStatus 归一化告警状态别名（active/triggered/open/pending→firing；
+// resolved/ok/recovered/closed/fired→resolved；ack→acknowledged；未知默认 firing）。
+func NormalizeStatus(s string) string {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "firing", "active", "triggered", "open", "pending":
 		return StatusFiring

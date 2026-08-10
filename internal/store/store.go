@@ -9,13 +9,17 @@ import (
 	"time"
 
 	"aiops/internal/alert"
+	"aiops/internal/assistant"
 	"aiops/internal/auth"
+	"aiops/internal/backup"
 	"aiops/internal/eventbus"
 	"aiops/internal/incident"
 	"aiops/internal/maintenance"
+	"aiops/internal/modelcfg"
 	"aiops/internal/notifier"
 	"aiops/internal/playbook"
 	"aiops/internal/provider"
+	"aiops/internal/rag"
 	"aiops/internal/topology"
 	"aiops/internal/workflow"
 
@@ -132,6 +136,7 @@ func migrate(db *gorm.DB, alertPartitions bool) error {
 		&incident.AlertToIncident{},
 		&incident.State{},
 		&incident.Rule{},
+		&incident.Resolution{}, // 结案数据契约（RAG Phase 0）
 		&provider.ProviderConfig{},
 		&topology.TopologyService{},
 		&topology.Edge{},
@@ -142,6 +147,25 @@ func migrate(db *gorm.DB, alertPartitions bool) error {
 		&workflow.WorkflowRun{},
 		&auth.APIKey{},
 		&eventbus.AuditLog{},
+		// RAG 知识库表（结构体不映射 vector/tsvector 列，扩展类 DDL 由 rag.EnsureSchema 显式管理）
+		&rag.KnowledgeDocument{},
+		&rag.KnowledgeChunk{},
+		&rag.KnowledgeEmbedding{},
+		&rag.KnowledgeJob{},
+		&rag.RAGTrace{},
+		&rag.RAGFeedback{},
+		&rag.KnowledgeSource{},  // 个人知识源（KEEPON M3：runbook/SOP 原文库）
+		&rag.GoldenQuery{},      // 检索评测 golden set（KEEPON M3）
+		&modelcfg.ModelConfig{}, // 大模型 API 接入配置（env 仅首启种子，DB 为准）
+		&backup.BackupRun{},     // 数据备份执行记录（KEEPON 4.1）
+		// 对话式 Agent（AGENT_CHAT_PLAN §6；action_requests 本期仅建 schema，Phase 3 启用）
+		&assistant.AssistantThread{},
+		&assistant.AssistantMessage{},
+		&assistant.AssistantRun{},
+		&assistant.AssistantStep{},
+		&assistant.AssistantActionRequest{},
+		&assistant.AssistantEvent{},
+		&assistant.AssistantFeedback{}, // 消息反馈（AGENT_CHAT_PLAN Phase 2）
 	}
 	if err := db.AutoMigrate(models...); err != nil {
 		return err

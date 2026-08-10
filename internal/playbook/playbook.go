@@ -6,6 +6,7 @@ package playbook
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"time"
 
 	"aiops/internal/util"
@@ -38,9 +39,14 @@ type Playbook struct {
 // TableName 表名。
 func (Playbook) TableName() string { return "playbooks" }
 
+// IndexHook 知识索引钩子（RAG 装配层注入；nil 时不进事务，行为与现有完全一致）。
+// 与 incident.IndexHook 同签名：同事务写 knowledge_jobs 保证索引最终一致。
+type IndexHook func(ctx context.Context, tx *gorm.DB, tenantID, sourceID string, sourceVersion int64, op string) error
+
 // Service 剧本仓储 + 默认种子。
 type Service struct {
-	db *gorm.DB
+	db      *gorm.DB
+	idxHook IndexHook
 }
 
 // NewService 创建剧本服务。
@@ -48,7 +54,10 @@ func NewService(db *gorm.DB) *Service {
 	return &Service{db: db}
 }
 
-// Create 创建剧本。
+// SetIndexHook 注入知识索引钩子（RAG 装配层；nil 保持现有行为）。
+func (s *Service) SetIndexHook(fn IndexHook) { s.idxHook = fn }
+
+// Create 创建剧本（装配索引钩子时同事务入队 upsert）。
 func (s *Service) Create(ctx context.Context, pb *Playbook) error {
 	if pb.ID == "" {
 		pb.ID = util.NewID()
@@ -61,7 +70,18 @@ func (s *Service) Create(ctx context.Context, pb *Playbook) error {
 	if pb.Level == "" {
 		pb.Level = LevelL1
 	}
-	return s.db.WithContext(ctx).Create(pb).Error
+	if s.idxHook == nil {
+		return s.db.WithContext(ctx).Create(pb).Error
+	}
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(pb).Error; err != nil {
+			return err
+		}
+		if err := s.idxHook(ctx, tx, pb.TenantID, pb.ID, pb.UpdatedAt.UnixNano(), "upsert"); err != nil {
+			slog.Warn("playbook: enqueue rag index job", "playbook", pb.ID, "err", err)
+		}
+		return nil
+	})
 }
 
 // List 返回某租户全部剧本。
@@ -83,6 +103,7 @@ func (s *Service) Get(ctx context.Context, tenantID, name string) (*Playbook, er
 }
 
 // Update 更新剧本（仅部分字段，安全字段除外）。
+// 装配索引钩子时同事务入队：启用 → upsert（新版本=UpdatedAt），停用 → delete（撤销派生知识）。
 func (s *Service) Update(ctx context.Context, pb *Playbook) error {
 	pb.UpdatedAt = time.Now().UTC()
 	updates := map[string]any{
@@ -90,13 +111,40 @@ func (s *Service) Update(ctx context.Context, pb *Playbook) error {
 		"blast_radius_factor": pb.BlastRadiusFactor, "rollback_command": pb.RollbackCommand,
 		"dry_run_first": pb.DryRunFirst, "enabled": pb.Enabled, "updated_at": pb.UpdatedAt,
 	}
-	return s.db.WithContext(ctx).Model(&Playbook{}).
-		Where("tenant_id = ? AND id = ?", pb.TenantID, pb.ID).Updates(updates).Error
+	if s.idxHook == nil {
+		return s.db.WithContext(ctx).Model(&Playbook{}).
+			Where("tenant_id = ? AND id = ?", pb.TenantID, pb.ID).Updates(updates).Error
+	}
+	op := "upsert"
+	if !pb.Enabled {
+		op = "delete"
+	}
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&Playbook{}).
+			Where("tenant_id = ? AND id = ?", pb.TenantID, pb.ID).Updates(updates).Error; err != nil {
+			return err
+		}
+		if err := s.idxHook(ctx, tx, pb.TenantID, pb.ID, pb.UpdatedAt.UnixNano(), op); err != nil {
+			slog.Warn("playbook: enqueue rag index job", "playbook", pb.ID, "err", err)
+		}
+		return nil
+	})
 }
 
-// Delete 删除剧本。
+// Delete 删除剧本（装配索引钩子时同事务入队 delete，撤销派生知识）。
 func (s *Service) Delete(ctx context.Context, tenantID, id string) error {
-	return s.db.WithContext(ctx).Where("tenant_id = ? AND id = ?", tenantID, id).Delete(&Playbook{}).Error
+	if s.idxHook == nil {
+		return s.db.WithContext(ctx).Where("tenant_id = ? AND id = ?", tenantID, id).Delete(&Playbook{}).Error
+	}
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("tenant_id = ? AND id = ?", tenantID, id).Delete(&Playbook{}).Error; err != nil {
+			return err
+		}
+		if err := s.idxHook(ctx, tx, tenantID, id, 0, "delete"); err != nil {
+			slog.Warn("playbook: enqueue rag delete job", "playbook", id, "err", err)
+		}
+		return nil
+	})
 }
 
 // Resolve 按建议动作选择可用剧本：优先精确匹配 name，其次第一个可用的 L0-L2 剧本。
@@ -152,7 +200,7 @@ func (s *Service) EnsureDefaults(ctx context.Context, tenantID string) error {
 		pb := d
 		pb.ID = util.NewID()
 		pb.TenantID = tenantID
-		if err := s.db.WithContext(ctx).Create(&pb).Error; err != nil {
+		if err := s.Create(ctx, &pb); err != nil { // 走 Create：索引钩子/ID/时间戳统一处理
 			return err
 		}
 	}

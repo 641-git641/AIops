@@ -10,6 +10,7 @@ import (
 const (
 	TaskWorkflowTrigger = "workflow.trigger"
 	TaskAgentRun        = "agent.run"
+	TaskNotifySend      = "notify.send" // 告警级通知（KEEPON 5.4 节流后发送）
 )
 
 // Task 队列任务。

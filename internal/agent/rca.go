@@ -10,6 +10,7 @@ import (
 
 	"aiops/internal/ai"
 	"aiops/internal/alert"
+	"aiops/internal/evidence"
 	"aiops/internal/incident"
 	"aiops/internal/topology"
 )
@@ -27,12 +28,13 @@ type RCALLM interface {
 // 告警平台场景下根因事实来源有限，采用启发式证据规则，失败也返回结构化结论。
 type RCAAgent struct {
 	topo *topology.Service
-	llm  RCALLM // 可选：nil 表示纯确定性
+	llm  RCALLM                      // 可选：nil 表示纯确定性
+	ev   *evidence.EvidenceCollector // 可选：nil 表示未配置数据源证据（行为完全不变）
 }
 
-// NewRCAAgent 创建 RCA Agent。llm 可为 nil（未配置 LLM 时不增强）。
-func NewRCAAgent(topo *topology.Service, llm RCALLM) *RCAAgent {
-	return &RCAAgent{topo: topo, llm: llm}
+// NewRCAAgent 创建 RCA Agent。llm 可为 nil（未配置 LLM 时不增强）；ev 可为 nil（未配置数据源）。
+func NewRCAAgent(topo *topology.Service, llm RCALLM, ev *evidence.EvidenceCollector) *RCAAgent {
+	return &RCAAgent{topo: topo, llm: llm, ev: ev}
 }
 
 // Name Agent 名称。
@@ -113,6 +115,13 @@ func (r *RCAAgent) collect(ctx context.Context, c *Context, svc string, result m
 	// 告警严重度提升置信度：critical 作为强先验叠加
 	if a.Severity == "critical" {
 		result["confidence"] = result["confidence"].(float64) + 0.15
+	}
+
+	// 证据 3：数据源证据（Prometheus 指标 / Loki 日志，可选；失败仅追加降级说明句子）
+	if r.ev != nil {
+		evidence, _ := result["evidence"].([]string)
+		evidence = append(evidence, r.ev.Collect(ctx, svc, a.StartedAt)...)
+		result["evidence"] = evidence
 	}
 
 	// LLM 增强：确定性证据链之外补充自然语言根因/建议（可选，失败不阻塞）

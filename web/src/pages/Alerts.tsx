@@ -1,8 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Button, Table, Tag, Typography, Space, Badge, Select, message } from 'antd'
-import { ThunderboltOutlined } from '@ant-design/icons'
+import { SendOutlined, ThunderboltOutlined } from '@ant-design/icons'
 import { useState } from 'react'
 import { api, type AlertDTO } from '../api'
+import GuideCard from '../components/GuideCard'
 
 const severityColor: Record<string, string> = {
   critical: 'red',
@@ -90,7 +91,34 @@ export default function Alerts() {
         dataSource={data?.items}
         columns={columns}
         pagination={{ total: data?.total, defaultPageSize: 20, showTotal: (t) => `共 ${t} 条` }}
+        locale={{ emptyText: <AlertGuide /> }}
       />
     </Space>
+  )
+}
+
+// AlertGuide 空状态接入向导（KEEPON 8.2 三步闭环第一步）：复制 curl + 发送测试告警。
+function AlertGuide() {
+  const qc = useQueryClient()
+  const send = useMutation({
+    mutationFn: api.sendTestAlert,
+    onSuccess: (r) => {
+      const e = r.events?.[0]
+      message.success(
+        `测试告警已发送${e ? `：归一化 severity=${e.severity}，指纹 ${e.fingerprint.slice(0, 8)}…` : ''}`,
+      )
+      qc.invalidateQueries({ queryKey: ['alerts'] })
+      qc.invalidateQueries({ queryKey: ['overview'] })
+    },
+    onError: (e: Error) => message.error(`发送失败：${e.message}`),
+  })
+  return (
+    <GuideCard
+      extra={
+        <Button type="primary" icon={<SendOutlined />} loading={send.isPending} onClick={() => send.mutate()}>
+          发送测试告警
+        </Button>
+      }
+    />
   )
 }

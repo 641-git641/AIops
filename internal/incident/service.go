@@ -3,6 +3,7 @@ package incident
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"time"
 
 	"aiops/internal/alert"
@@ -20,9 +21,10 @@ type IncidentNotify func(ctx context.Context, inc *Incident, action string)
 
 // Service Incident 领域服务。
 type Service struct {
-	db     *gorm.DB
-	notify IncidentNotify    // 生命周期通知（可选，nil 跳过）
-	m      *metrics.Registry // 指标注册表（Phase 3 压测观测；nil 跳过埋点）
+	db      *gorm.DB
+	notify  IncidentNotify    // 生命周期通知（可选，nil 跳过）
+	resHook IndexHook         // 知识索引钩子（RAG 装配层注入；nil 时不进事务，行为与现有完全一致）
+	m       *metrics.Registry // 指标注册表（Phase 3 压测观测；nil 跳过埋点）
 }
 
 // NewService 创建 Incident 服务。
@@ -32,6 +34,9 @@ func NewService(db *gorm.DB) *Service {
 
 // SetNotifyFunc 注入事故生命周期通知回调（新建/解决时触发，fail-open）。
 func (s *Service) SetNotifyFunc(fn IncidentNotify) { s.notify = fn }
+
+// SetResIndexHook 注入结案/解决知识索引钩子（RAG 装配层；nil 保持现有行为）。
+func (s *Service) SetResIndexHook(fn IndexHook) { s.resHook = fn }
 
 // SetMetrics 装配指标注册表（Phase 3 压测观测；nil 关闭埋点）。
 func (s *Service) SetMetrics(m *metrics.Registry) { s.m = m }
@@ -139,12 +144,31 @@ func (s *Service) ResolveSilent(ctx context.Context, tenantID, id string) error 
 	return s.resolveDB(ctx, tenantID, id)
 }
 
-// resolveDB 纯 DB 更新解决状态（resolved_at 幂等）。
+// resolveDB 更新解决状态（resolved_at 幂等）。装配了索引钩子时同事务入队
+// 知识索引任务（source_version=结案数据当前版本，无结案为 0：已解决事故即入知识库
+// 作为 T1 参考，结案数据后续补录会生成新版本）。
 func (s *Service) resolveDB(ctx context.Context, tenantID, id string) error {
 	now := time.Now().UTC()
-	return s.db.WithContext(ctx).Model(&Incident{}).
-		Where("tenant_id = ? AND id = ?", tenantID, id).
-		Updates(map[string]any{"status": IncidentResolved, "resolved_at": now}).Error
+	if s.resHook == nil {
+		return s.db.WithContext(ctx).Model(&Incident{}).
+			Where("tenant_id = ? AND id = ?", tenantID, id).
+			Updates(map[string]any{"status": IncidentResolved, "resolved_at": now}).Error
+	}
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&Incident{}).
+			Where("tenant_id = ? AND id = ?", tenantID, id).
+			Updates(map[string]any{"status": IncidentResolved, "resolved_at": now}).Error; err != nil {
+			return err
+		}
+		// 取结案数据当前版本（无结案数据视为 0）；查询失败不阻塞解决（reconciliation 兜底）
+		var version int64
+		_ = tx.Raw(`SELECT COALESCE(MAX(version), 0) FROM incident_resolutions
+			WHERE tenant_id = ? AND incident_id = ?`, tenantID, id).Scan(&version).Error
+		if err := s.resHook(ctx, tx, tenantID, id, version, "upsert"); err != nil {
+			slog.Warn("incident: enqueue rag index job on resolve", "incident", id, "err", err)
+		}
+		return nil
+	})
 }
 
 // UpdateLLMSummary 更新事故的 LLM 增强摘要（llmSummary 为空时不更新，保留现值）。

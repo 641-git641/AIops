@@ -42,6 +42,8 @@ type Pipeline struct {
 	AgentEnabled bool
 	// workflowTrigger 投递 workflow.trigger 任务（工作流引擎；由装配层注入，默认 nil 关闭）。
 	workflowTrigger func(ctx context.Context, a *alert.Alert)
+	// notifyTrigger 投递 notify.send 任务（通知节流；由装配层注入，默认 nil 关闭）。
+	notifyTrigger func(ctx context.Context, a *alert.Alert)
 	// metrics 指标注册表（Phase 3 压测观测；nil 跳过埋点）。
 	m *metrics.Registry
 }
@@ -75,6 +77,11 @@ func (p *Pipeline) InvalidateMaintenance(tenantID string) {
 // SetWorkflowTrigger 装配工作流触发回调（nil 则关闭工作流引擎投递）。
 func (p *Pipeline) SetWorkflowTrigger(fn func(ctx context.Context, a *alert.Alert)) {
 	p.workflowTrigger = fn
+}
+
+// SetNotifyTrigger 装配告警级通知触发回调（KEEPON 5.4 节流；nil 关闭）。
+func (p *Pipeline) SetNotifyTrigger(fn func(ctx context.Context, a *alert.Alert)) {
+	p.notifyTrigger = fn
 }
 
 // SetMetrics 装配指标注册表（Phase 3 压测观测；nil 关闭埋点）。
@@ -317,6 +324,11 @@ func (p *Pipeline) finalizeSaved(ctx context.Context, a *alert.Alert, kind alert
 
 	// 事件总线（审计/扩散）
 	p.publishEvent(ctx, eventType, a, inc)
+
+	// 告警级通知（KEEPON 5.4 节流；异步投递，热路径不阻塞；物理去重的 duplicate 不触发）
+	if p.notifyTrigger != nil {
+		p.notifyTrigger(ctx, a)
+	}
 
 	// Agent 路径触发：severity>=high 或规则配置 runAgent（可全局关闭）
 	if p.AgentEnabled && shouldRunAgent(a, inc) {

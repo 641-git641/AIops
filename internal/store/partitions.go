@@ -91,6 +91,8 @@ func ensureAlertIndexes(db *gorm.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_alerts_created ON alerts (created_at)",
 		"CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts (status)",
 		"CREATE INDEX IF NOT EXISTS idx_alerts_tenant_created ON alerts (tenant_id, severity, fingerprint)",
+		// 总览聚合（KEEPON M2）：tenant + created_at 前缀触发分区裁剪 + 小时趋势/分布/最近事件
+		"CREATE INDEX IF NOT EXISTS idx_alerts_tenant_created_at ON alerts (tenant_id, created_at)",
 	} {
 		if err := db.Exec(ddl).Error; err != nil {
 			return fmt.Errorf("store: ensure alert index: %w", err)

@@ -25,12 +25,13 @@ func (s *Server) handleListIncidents(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"items": items, "total": total, "limit": limit, "offset": offset})
 }
 
-// incidentDetail 事故详情聚合（含关联告警 + 编排器状态 + 各 Agent 结果）。
+// incidentDetail 事故详情聚合（含关联告警 + 编排器状态 + 各 Agent 结果 + 结案数据）。
 type incidentDetail struct {
 	incident.Incident
-	Alerts      []alert.DTO     `json:"alerts"`
-	State       *incident.State `json:"state,omitempty"`
-	NodeResults map[string]any  `json:"nodeResults,omitempty"`
+	Alerts      []alert.DTO          `json:"alerts"`
+	State       *incident.State      `json:"state,omitempty"`
+	NodeResults map[string]any       `json:"nodeResults,omitempty"`
+	Resolution  *incident.Resolution `json:"resolution,omitempty"` // 结案数据契约（RAG Phase 0）
 }
 
 // handleGetIncident 事故详情。
@@ -49,6 +50,7 @@ func (s *Server) handleGetIncident(c *gin.Context) {
 	for i := range alerts {
 		detail.Alerts = append(detail.Alerts, alerts[i].ToDTO())
 	}
+	detail.Resolution, _ = s.svc.GetResolution(ctx, tenantID(c), id)
 
 	st, err := s.svc.GetState(ctx, tenantID(c), id)
 	if err == nil && st != nil {
@@ -118,4 +120,49 @@ func (s *Server) handleResolveIncident(c *gin.Context) {
 		s.push.Broadcast(pusher.Event{Type: "incident.upsert", TenantID: inc.TenantID, Data: inc})
 	}
 	c.JSON(http.StatusOK, gin.H{"id": id, "status": incident.IncidentResolved})
+}
+
+// resolutionInput 结案数据请求体（RAG Phase 0 数据契约）。
+type resolutionInput struct {
+	ConfirmedRootCause string `json:"confirmedRootCause"`
+	Resolution         string `json:"resolution"`
+	Outcome            string `json:"outcome"`
+	Verification       string `json:"verification"`
+	VerificationStatus string `json:"verificationStatus"`
+	PostmortemURL      string `json:"postmortemUrl"`
+	ResolvedBy         string `json:"resolvedBy"`
+}
+
+// handleUpsertResolution 写入/更新结案数据（仅已解决事故；一对一幂等，version 递增）。
+func (s *Server) handleUpsertResolution(c *gin.Context) {
+	id := c.Param("id")
+	ctx := c.Request.Context()
+	inc, err := s.svc.Get(ctx, tenantID(c), id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "incident not found"})
+		return
+	}
+	if inc.Status != incident.IncidentResolved {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "仅已解决事故可填写结案数据（先 POST /incidents/:id/resolve）"})
+		return
+	}
+	var in resolutionInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	r := &incident.Resolution{
+		ConfirmedRootCause: in.ConfirmedRootCause,
+		Resolution:         in.Resolution,
+		Outcome:            in.Outcome,
+		Verification:       in.Verification,
+		VerificationStatus: in.VerificationStatus,
+		PostmortemURL:      in.PostmortemURL,
+		ResolvedBy:         in.ResolvedBy,
+	}
+	if err := s.svc.UpsertResolution(ctx, tenantID(c), id, r); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"id": id, "version": r.Version, "verificationStatus": r.VerificationStatus})
 }
