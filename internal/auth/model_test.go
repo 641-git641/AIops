@@ -93,3 +93,37 @@ func TestEnsureOwnerKey(t *testing.T) {
 		t.Fatal("new owner key must verify")
 	}
 }
+
+// VerifyOwner：owner key ok=true，普通 key ok=false（动作确认保护）。
+func TestVerifyOwner(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	s := auth.NewService(db)
+
+	owner, err := s.EnsureOwnerKey(ctx)
+	if err != nil || owner == "" {
+		t.Fatalf("ensure owner = %q, %v", owner, err)
+	}
+	regular, err := s.Create(ctx, auth.DefaultTenant, "script")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// owner → ok
+	tid, ok, err := s.VerifyOwner(ctx, owner)
+	if err != nil || !ok || tid != auth.DefaultTenant {
+		t.Fatalf("owner key: ok=%v tid=%s err=%v", ok, tid, err)
+	}
+	// 普通 key → ok=false（无错误）
+	tid, ok, err = s.VerifyOwner(ctx, regular)
+	if err != nil || ok {
+		t.Fatalf("regular key: ok=%v tid=%s err=%v（应 ok=false 无错）", ok, tid, err)
+	}
+	// 无效 key → err
+	if _, _, err := s.VerifyOwner(ctx, "no-such"); err == nil {
+		t.Fatal("invalid key should error")
+	}
+	// 空 key → ok=false 无错（handler 无需区分）
+	if _, ok, err := s.VerifyOwner(ctx, ""); err != nil || ok {
+		t.Fatalf("empty key: ok=%v err=%v", ok, err)
+	}
+}

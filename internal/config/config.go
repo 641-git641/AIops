@@ -146,7 +146,7 @@ type Config struct {
 	AssistantMaxToolCalls   int    // 单 run 最大工具调用数（默认 12）
 	AssistantRunTimeoutSec  int    // 单 run 总超时秒（默认 60）
 	AssistantToolTimeoutSec int    // 单工具执行超时秒（默认 3）
-	AssistantRetentionDays  int    // 会话/消息保留天数（默认 90；本期仅存配置，清理 Phase 4）
+	AssistantRetentionDays  int    // 对话 Agent 消息/步骤/事件/动作/反馈保留天数（默认 90；threads 不参与）
 	AssistantPromptVersion  string // 系统提示词版本（默认 v1）
 
 	// assistant_chat 模型端点 env（仅首启种子，DB 为准；与 Chat/Embedding 密钥逻辑分离，§9.3）

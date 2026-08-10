@@ -1,7 +1,7 @@
 # AIOps 告警平台 — 项目进度交接文档
 
 > 用途：跨会话/换窗口继续开发的现状快照。任何新窗口先读本文件 + README.md + **docs/GUIDE.md**（架构与功能使用深度指南）+ **docs/GLOSSARY.md**（运维概念与黑话入门）。
-> 最后更新：2026-08-10（Phase 8 KEEPON M3 + 基础设施指标 + Phase 9/10 对话式 Agent 阶段二/三 + **Phase 11 KEEPON M4 体验与智能增强**，详见 §1 Phase 11）
+> 最后更新：2026-08-10（Phase 8 KEEPON M3 + 基础设施指标 + Phase 9/10 对话式 Agent 阶段二/三 + **Phase 11 KEEPON M4** + **Phase 12 收尾：Agent 数据保留策略 + 动作确认 owner 保护**，详见 §1 Phase 11/12）
 
 ---
 
@@ -414,6 +414,19 @@ Alert → process_event ──┬── 确定性热路径（去重 → 入库 �
 - **首版异常检测**（internal/anomaly，P3）：`GET /anomaly/alerts?hours&historyDays`——24h 逐小时告警计数 vs 历史同期（同小时）均值 ±2σ 基线；**基线样本排除观察窗口自身**（自己不比自己）；样本 <3 天明确标注「样本不足」不误报；std=0（历史完全稳定）时区间收敛到均值、任何超量即异常；**只提示不自动动作**；总览页「告警异常检测」卡片（异常小时红点 + 偏移 σ + 区间 + 原因）。
 - **e2e（2026-08-10）**：种子播种/非法 URL 400/CRUD/重启不重复播种（DB 为准）；洪峰数据（当前小时 40 条 vs 历史 7 天同小时基线）→ anomaly=true + σ=10.2 + 区间展示；`go test ./...` 全绿 + tsc/build 通过。
 - **踩坑记录**：① `in` 是 TS 保留字不能做函数参数名（api.ts 报 TS1109）；② anomaly 基线首版把当前小时自身计入样本（自己比自己，稀释异常）——窗口内数据排除出基线；③ external 测试包 import store 形成 cycle（store 注册 external 模型）——it 测试用外部包 `external_test`。
+
+### Phase 12 — 收尾：Agent 数据保留策略 + 动作确认 owner 保护 ✅（2026-08-10）
+
+项目收官前的两项补缺（个人使用场景评估后只保留这两个：retention 执行 + apikey 模式动作保护；限流/身份 scopes/prompt 评测对单人使用无必要，按 KEEPON 原则 7 不做）。
+
+- **assistant 数据保留策略执行**（AGENT_CHAT_PLAN §6.6/Phase 4 中唯一对个人有实际价值的一项）：
+  - `AIOPS_ASSISTANT_RETENTIONDAYS`（默认 90）从「只存配置」变为生效——复用现有 retention worker（boot + 定时分批删除，避免长事务）；
+  - 覆盖 5 张表：assistant_messages / steps / events / action_requests / feedback（均按 created_at）；**threads 不参与**（仅标题，软删会话保留找回入口）。
+- **动作确认 owner 保护**（§9.1 的低成本前置项）：
+  - `auth.VerifyOwner`（key 存在且 is_owner）+ confirm/reject 端点 `requireOwnerKey`——**apikey 模式下仅 owner key 可确认/拒绝动作**（普通 key 403「仅 owner key 可确认/拒绝动作（普通 key 只读）」）；
+  - noauth 本地模式直通（个人使用体验不变）；不引入完整 scopes（留给真正多用户场景）。
+- **e2e（2026-08-10）**：100 天前 assistant 数据 boot 清理删除（rows=1）；apikey 模式普通 key confirm → 403、owner key → succeeded；`go test ./...` 全绿。
+- **项目收官状态**：KEEPON M1~M4 全部 ✅ + AGENT_CHAT_PLAN Phase 0~3 全部 ✅ + Phase 12 收尾 ✅——四大产品判断标准（一眼看到/一条命令/一次结案/出事能恢复）全部兑现。后续候选仅按需迭代（模型评测、异常检测误报率调优、多用户身份）。
 
 ---
 

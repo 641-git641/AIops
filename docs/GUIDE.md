@@ -481,7 +481,8 @@ go run ./cmd/aiops
 
 - 生成模型要求 OpenAI 兼容且支持 tool calling（qwen-plus / deepseek-chat 均可）；模型配置页「Assistant Chat」行可管理（env 仅首启种子）。
 - 未配置模型时服务照常启动，run 快速失败 `model_not_configured`（不重试）；`AIOPS_ASSISTANTENABLED=false` 时全部 `/assistant` 端点 404，现有路径零变化。
-- **动作确认（Phase 3）**：模型提出的动作请求默认 15 分钟有效，过期自动失效；确认/拒绝接口需要登录态（本地 noauth 模式直接可用）；动作执行复用现有领域语义——`approve_incident_action` 与事故详情页「审批」按钮走同一编排器审批链（L0/L1/L2、dry-run、爆炸半径完全保留）。
+- **动作确认（Phase 3）**：模型提出的动作请求默认 15 分钟有效，过期自动失效；确认/拒绝接口需要登录态（本地 noauth 模式直接可用）；**apikey 模式下仅 owner key 可确认/拒绝动作**（普通 key 只读）；动作执行复用现有领域语义——`approve_incident_action` 与事故详情页「审批」按钮走同一编排器审批链（L0/L1/L2、dry-run、爆炸半径完全保留）。
+- **数据保留（Phase 12）**：消息/步骤/事件/动作请求/反馈按 `AIOPS_ASSISTANT_RETENTIONDAYS`（默认 90 天）随保留策略 worker 自动清理（启动与每小时各一次，分批删除）；会话（threads）只保留标题，不参与清理。
 - **知识类工具需要 RAG 开启**（`AIOPS_RAGENABLED=true` + embedding 配置，见 §14）：RAG 关闭时 `search_knowledge`/`get_similar_incidents` 不注册（工具列表不出现），聊天仍可用领域只读工具；向量路失败自动关键词降级，回答与工具卡均透出降级原因。
 - 数据表 7 张（threads/messages/runs/steps/events/action_requests + **feedback**，见 §3 数据模型表），`assistant_events` 的 sequence 由 SQL 原子分配（重启安全）。
 

@@ -421,6 +421,12 @@ func main() {
 			{Table: "alerts", TimeColumn: "created_at", Days: cfg.RetentionAlertsDays, DropPartitions: cfg.AlertPartitions},
 			{Table: "audit_logs", TimeColumn: "created_at", Days: cfg.RetentionAuditDays},
 			{Table: "workflow_runs", TimeColumn: "started_at", Days: cfg.RetentionWorkflowRunsDays},
+			// 对话 Agent 数据（AGENT_CHAT_PLAN §6.6 保留期；threads 仅标题不参与，软删会话保留）
+			{Table: "assistant_messages", TimeColumn: "created_at", Days: cfg.AssistantRetentionDays},
+			{Table: "assistant_steps", TimeColumn: "created_at", Days: cfg.AssistantRetentionDays},
+			{Table: "assistant_events", TimeColumn: "created_at", Days: cfg.AssistantRetentionDays},
+			{Table: "assistant_action_requests", TimeColumn: "created_at", Days: cfg.AssistantRetentionDays},
+			{Table: "assistant_feedback", TimeColumn: "created_at", Days: cfg.AssistantRetentionDays},
 		})
 		interval := time.Duration(cfg.RetentionIntervalMin) * time.Minute
 		if interval <= 0 {
@@ -441,7 +447,8 @@ func main() {
 		}()
 		slog.Info("retention worker enabled",
 			"alertsDays", cfg.RetentionAlertsDays, "auditDays", cfg.RetentionAuditDays,
-			"workflowRunsDays", cfg.RetentionWorkflowRunsDays, "intervalMin", cfg.RetentionIntervalMin)
+			"workflowRunsDays", cfg.RetentionWorkflowRunsDays, "assistantDays", cfg.AssistantRetentionDays,
+			"intervalMin", cfg.RetentionIntervalMin)
 	}
 
 	// 6.7 数据备份 worker（KEEPON 4.1）：定时 pg_dump + 轮转 + 可选镜像加密/恢复校验。

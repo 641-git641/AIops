@@ -206,9 +206,23 @@ type actionDecisionInput struct {
 	Reason string `json:"reason"`
 }
 
+// requireOwnerKey 高风险动作确认的保护：apikey 模式仅 owner key 可确认/拒绝
+// （noauth 本地模式直通）。低成本实现，不引入完整 scopes（AGENT_CHAT_PLAN §9.1 后续）。
+func (s *Server) requireOwnerKey(c *gin.Context) bool {
+	if s.cfg.AuthType != "apikey" {
+		return true
+	}
+	_, ok, err := s.authSvc.VerifyOwner(c.Request.Context(), c.GetHeader("X-API-Key"))
+	if err != nil || !ok {
+		c.JSON(http.StatusForbidden, gin.H{"error": "仅 owner key 可确认/拒绝动作（普通 key 只读）"})
+		return false
+	}
+	return true
+}
+
 // handleConfirmAction 确认动作请求并执行（幂等：重复确认返回已处理错误）。
 func (s *Server) handleConfirmAction(c *gin.Context) {
-	if !s.assistantGate(c) {
+	if !s.assistantGate(c) || !s.requireOwnerKey(c) {
 		return
 	}
 	var in actionDecisionInput
@@ -238,7 +252,7 @@ func (s *Server) handleConfirmAction(c *gin.Context) {
 
 // handleRejectAction 拒绝动作请求（不执行）。
 func (s *Server) handleRejectAction(c *gin.Context) {
-	if !s.assistantGate(c) {
+	if !s.assistantGate(c) || !s.requireOwnerKey(c) {
 		return
 	}
 	var in actionDecisionInput

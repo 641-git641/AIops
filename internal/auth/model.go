@@ -62,6 +62,19 @@ func (s *Service) Verify(ctx context.Context, secret string) (string, error) {
 	return key.TenantID, nil
 }
 
+// VerifyOwner 校验 key 且必须是 owner（高风险动作确认用；非 owner 返回 ok=false）。
+func (s *Service) VerifyOwner(ctx context.Context, secret string) (tenantID string, ok bool, err error) {
+	if secret == "" {
+		return "", false, nil
+	}
+	var key APIKey
+	err = s.db.WithContext(ctx).Where("secret_hash = ?", util.SHA256(secret)).First(&key).Error
+	if err != nil {
+		return "", false, err
+	}
+	return key.TenantID, key.IsOwner, nil
+}
+
 // List 列出租户的全部 key（不含哈希）。
 func (s *Service) List(ctx context.Context, tenantID string) ([]APIKey, error) {
 	var keys []APIKey
