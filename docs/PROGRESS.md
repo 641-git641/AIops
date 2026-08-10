@@ -1,7 +1,7 @@
 # AIOps 告警平台 — 项目进度交接文档
 
 > 用途：跨会话/换窗口继续开发的现状快照。任何新窗口先读本文件 + README.md + **docs/GUIDE.md**（架构与功能使用深度指南）+ **docs/GLOSSARY.md**（运维概念与黑话入门）。
-> 最后更新：2026-08-10（Phase 8 KEEPON M3 + 基础设施指标 + **Phase 9 对话式 Agent 阶段二：事故诊断与 RAG 引用**，详见 §1 Phase 9）
+> 最后更新：2026-08-10（Phase 8 KEEPON M3 + 基础设施指标 + Phase 9/10 对话式 Agent 阶段二/三 + **Phase 11 KEEPON M4 体验与智能增强**，详见 §1 Phase 11）
 
 ---
 
@@ -383,6 +383,37 @@ Alert → process_event ──┬── 确定性热路径（去重 → 入库 �
 - **踩坑记录**：① `incident.Service.Get` 对不存在返回 `gorm.ErrRecordNotFound` **error**（与 alert repo 的 nil,nil 语义不同）——get_similar_incidents 首版把不存在事故当工具失败，e2e 抓到后按「事故不存在」降级结果处理；② react-query v5 `useMutation` 的可选参数 mutationFn 仍要求显式传 `mutate(undefined)`；③ Git Bash curl `-d` 直写中文按 GBK 发送（mock 收到乱码→关键词分发失效）——e2e 用 UTF-8 文件 `-d @file`。
 - **e2e（2026-08-10，mock LLM + RAG local embedding）**：绑定事故会话创建（contextType/contextId/标题默认事故名）→「查询知识库…」→ search_knowledge 真实检索（命中 5 条证据：incident×3 T3/T1 + runbook×1 T2 + playbook×1 T2）→ SSE `tool.started→tool.completed→citation.added×5→message.delta→run.completed` → 消息 citations 落库（URL 正确）→ 反馈 204/非法 rating 400 → metrics 计数正确；get_similar_incidents 与 list_playbooks 各自工具链路全通；`go test ./...` 30 包全绿 + `npm run build` 通过。
 - **已知限制**：citation 为「run 内所有工具命中的证据」全集（未按最终回答实际引用过滤——引用精度评测留待 Phase 4 离线问题集）；`assistant_feedback` 无独立保留策略（随 Phase 4 retention 一并做）；runbook 来源无固定前端路由（引用卡跳 /knowledge）。
+
+### Phase 10 — 对话式 Agent 阶段三：人工确认动作 ✅（2026-08-10）
+
+按 AGENT_CHAT_PLAN Phase 3 实施（action request 状态机 + 首批 3 个动作工具 + 确认/拒绝端点 + 前端确认卡）。**模型只能「提出」，副作用只在确认路径执行**（§9.2 动作隔离）。
+
+- **动作状态机**（`assistant_action_requests` 表 Phase 0 已建 schema，本期启用）：`pending → executing → succeeded | failed`；`rejected` / `expired`（15min 未确认）；`pending→executing` 用 **CAS 条件更新**（防双击/并发重复确认）；幂等键 `asst:<runID>:<toolCallID>`（同 tool call 重试复用请求）。
+- **3 个动作工具**（tools_action.go，`Tool.Action` 规范 + 依赖缺失不注册）：
+  - `ack_alert`（low）：`alert.Repo.UpdateStatus → acknowledged`；
+  - `resolve_incident`（medium）：`incident.Service.Resolve`（状态更新 + 通知 + 知识索引入队）；
+  - `approve_incident_action`（high，decision approve/reject）：`Orchestrator.ApproveAction`（**复用现有 pending_approval 校验/heal 闭环/审批审计**）；
+  - 提出时仅做存在性预检（Validate）；`runner.requestAction` 创建 pending + 发布 `action.required` 事件 + 返回「已提交人工确认」（确认前不执行任何操作）。
+- **确认/拒绝重验**（service.go，§9.2 六重校验在确认路径重新执行）：归属租户 → pending → 未过期 → CAS → 执行器（executor.go 表驱动）→ succeeded/failed（失败原因进 DecisionReason，前端展示）；拒绝不执行；审计 `assistant.action.executed|failed|rejected`（actor/run/tool/目标全部可回溯）+ `aiops_assistant_action_requests_total{tool,decision,outcome}` 指标。
+- **API**：`POST /assistant/actions/:id/confirm|reject`（重复/过期 409，不存在 404）+ `GET /assistant/threads/:id/actions`（页面刷新恢复确认卡）；事件 `action.required` / `action.resolved`。
+- **前端**：ActionApprovalCard（工具名/参数/风险 Tag/状态 + 确认执行（高风险红色确认弹窗）/拒绝按钮，决策后失效重拉）；streamReducer 聚合 action 事件（按 id 去重/更新）；ChatTimeline 历史+流式合并渲染；Assistant 页加载线程 actions。
+- **e2e（2026-08-10，mock LLM）**：提出（approve_incident_action pending/high/15min 过期）→ 确认 → succeeded + **编排器闭环（incident/state 均 resolved，heal 节点闭环）** → 重复确认 409；拒绝 → rejected + 领域状态不变；指标计数正确；`go test ./...` 全绿 + tsc 通过。
+- **踩坑记录**：① `incident.Service.Get`/`alert.Repo.Get` 对不存在返回 `gorm.ErrRecordNotFound`（第三处同类坑）——Validate 预检未归一化导致 mock 的虚构 ID 被当真实错误（run 正常完成但动作请求未创建，SSE 无事件）；统一 `notFoundErr` 归一化；② 非 pending 状态错误需包 sentinel（`%w: ErrActionNotPending`）否则 API 层 `errors.Is` 不匹配落 500 而非 409；③ 编排器 ApproveAction 依赖 `bus/push` 广播——测试需传 `eventbus.NewMemoryBus()` + no-op broadcaster。
+- **已知限制**：actor 仍为 `local-noauth`（§9.1 可信身份/scopes 未做——本地单用户可接受，开放部署前必须补）；run 不挂起等待确认（动作异步独立执行，模型提出后 run 正常结束）；`assistant_action_requests` 无独立保留策略（随 Phase 4 retention 一并做）。
+
+### Phase 11 — KEEPON M4 体验与智能增强 ✅（2026-08-10）
+
+按 KEEPON.md Milestone 4 实施（外部系统入口 / 文案空状态 / 配置迁移 / 首版异常检测），**KEEPON 全部里程碑收官**。
+
+- **外部可观测系统入口**（internal/external + `external_systems` 表）：
+  - 「env 首启种子、DB 为准、保存后热生效」：`AIOPS_EXTERNALSYSTEMS`（JSON 数组）仅表空时播种（Seed 幂等，非法条目跳过不覆盖）；之后全部走 DB，无需重启；
+  - CRUD API（`/external-systems`）+ 设置页「外部系统」Tab（名称/URL/类型预设/启用/排序）；
+  - 侧边栏「外部系统」分组：enabled 条目点击 `window.open(url, '_blank', 'noopener,noreferrer')` 新标签页打开；**URL 白名单仅 http/https**（ValidateURL 防 `javascript:` 注入，前后端双重校验）。
+- **文案与空状态收敛**：Incidents（空 → 可复制 generic curl + 指引）、Playbooks / 维护窗口 / 工作流（空 → 明确下一步操作）补 Empty 引导；总览接入引导（GuideCard curl + 测试按钮）与 Alerts 空状态此前已达标；统一「还没有 X → 下一步」句式。
+- **配置迁移说明**（docs/MIGRATION.md）：配置分布一览（DB 化项 vs env 项）+ 备份恢复迁移流程 + 换机器检查清单（向量维度一致/密钥随备份/恢复演练）；**模型密钥明文不单独导出**。
+- **首版异常检测**（internal/anomaly，P3）：`GET /anomaly/alerts?hours&historyDays`——24h 逐小时告警计数 vs 历史同期（同小时）均值 ±2σ 基线；**基线样本排除观察窗口自身**（自己不比自己）；样本 <3 天明确标注「样本不足」不误报；std=0（历史完全稳定）时区间收敛到均值、任何超量即异常；**只提示不自动动作**；总览页「告警异常检测」卡片（异常小时红点 + 偏移 σ + 区间 + 原因）。
+- **e2e（2026-08-10）**：种子播种/非法 URL 400/CRUD/重启不重复播种（DB 为准）；洪峰数据（当前小时 40 条 vs 历史 7 天同小时基线）→ anomaly=true + σ=10.2 + 区间展示；`go test ./...` 全绿 + tsc/build 通过。
+- **踩坑记录**：① `in` 是 TS 保留字不能做函数参数名（api.ts 报 TS1109）；② anomaly 基线首版把当前小时自身计入样本（自己比自己，稀释异常）——窗口内数据排除出基线；③ external 测试包 import store 形成 cycle（store 注册 external 模型）——it 测试用外部包 `external_test`。
 
 ---
 

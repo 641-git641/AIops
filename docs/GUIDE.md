@@ -463,6 +463,7 @@ workflow:
 - **只读工具**（基础 6 个 + 知识 3 个，全部参数二次校验 + 结果裁剪 + 审计）：`get_platform_overview` / `list_alerts` / `get_alert` / `list_incidents` / `get_incident`（含 monitor/rca/heal/change 四节点摘要）/ `get_topology_impact`；**知识类**（Phase 2，RAG 关闭时不注册）：`search_knowledge`（知识库通用检索）/ `get_similar_incidents`（相似历史事故，排除自身）/ `list_playbooks`（剧本元数据）。
 - **引用与反馈**（Phase 2）：检索类工具命中证据 → `citation.added` 事件实时推送 + 最终回答消息落 `citations` 字段；前端引用卡可点跳转（事故/剧本/知识）；回答下方「有用/没用」反馈（`POST /messages/:id/feedback`）。
 - **上下文绑定**（Phase 2）：会话可绑定事故（`contextType: "incident"`）；事故详情页「在 AI 助手中分析」一键进入；run 自动注入绑定事故的确定性事实摘要；超长历史自动裁剪并生成早期对话摘要。
+- **人工确认动作**（Phase 3）：模型只能**提出**动作请求（`ack_alert` / `resolve_incident` / `approve_incident_action`，低/中/高风险），聊天区出现确认卡，**确认后才执行**（复用领域 Service 与编排器审批语义）；确认/拒绝走 `POST /assistant/actions/:id/confirm|reject`（重复/过期 409），请求 15 分钟未确认自动过期。
 - **流式**：`GET /runs/:id/events` 是**全仓第一个出站 SSE**（快照续传 + 实时订阅 + 15s 心跳）；SSE handler 内清除底层 deadline（全局 WriteTimeout=30s 不豁免——对齐 WS 先例）。
 - **硬限制**：单 run ≤8 模型回合 / ≤12 工具调用 / 60s 总超时 / 3s 工具超时；未知工具与非法参数**拒绝执行**并继续（不 panic、不终止 run）。
 - **安全**：工具结果与知识内容视为不可信数据（防提示注入，疑似密钥的查询不送向量服务）；run/步骤/事件全 tenant 强制；审计 `assistant.*` 动作（Actor 本期 `local-noauth`）。
@@ -480,12 +481,13 @@ go run ./cmd/aiops
 
 - 生成模型要求 OpenAI 兼容且支持 tool calling（qwen-plus / deepseek-chat 均可）；模型配置页「Assistant Chat」行可管理（env 仅首启种子）。
 - 未配置模型时服务照常启动，run 快速失败 `model_not_configured`（不重试）；`AIOPS_ASSISTANTENABLED=false` 时全部 `/assistant` 端点 404，现有路径零变化。
+- **动作确认（Phase 3）**：模型提出的动作请求默认 15 分钟有效，过期自动失效；确认/拒绝接口需要登录态（本地 noauth 模式直接可用）；动作执行复用现有领域语义——`approve_incident_action` 与事故详情页「审批」按钮走同一编排器审批链（L0/L1/L2、dry-run、爆炸半径完全保留）。
 - **知识类工具需要 RAG 开启**（`AIOPS_RAGENABLED=true` + embedding 配置，见 §14）：RAG 关闭时 `search_knowledge`/`get_similar_incidents` 不注册（工具列表不出现），聊天仍可用领域只读工具；向量路失败自动关键词降级，回答与工具卡均透出降级原因。
 - 数据表 7 张（threads/messages/runs/steps/events/action_requests + **feedback**，见 §3 数据模型表），`assistant_events` 的 sequence 由 SQL 原子分配（重启安全）。
 
 ### 15.3 指标（`/metrics`）
 
-`aiops_assistant_runs_total{status,model}`、`aiops_assistant_run_duration_seconds`、`aiops_assistant_model_duration_seconds`、`aiops_assistant_tool_calls_total{tool,outcome}`、`aiops_assistant_tool_duration_seconds`、`aiops_assistant_active_runs`、`aiops_assistant_tokens_total{direction,model}`；Phase 2 新增 `aiops_assistant_citations_total{source_type}`（回答引用）与 `aiops_assistant_feedback_total{rating}`（消息反馈）。
+`aiops_assistant_runs_total{status,model}`、`aiops_assistant_run_duration_seconds`、`aiops_assistant_model_duration_seconds`、`aiops_assistant_tool_calls_total{tool,outcome}`、`aiops_assistant_tool_duration_seconds`、`aiops_assistant_active_runs`、`aiops_assistant_tokens_total{direction,model}`；Phase 2 新增 `aiops_assistant_citations_total{source_type}`（回答引用）与 `aiops_assistant_feedback_total{rating}`（消息反馈）；Phase 3 新增 `aiops_assistant_action_requests_total{tool,decision,outcome}`（动作请求提出/确认/拒绝结算）。
 
 ---
 

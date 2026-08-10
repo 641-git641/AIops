@@ -399,12 +399,12 @@ name / url / type / enabled / sortOrder
 - [x] 检索 golden set 与基线指标（rag_golden_queries 表 + cmd/rag-eval：Recall@K/首条命中/空结果率，调参前后 -baseline 对比）
 - [x] Markdown/runbook 知识源管理（knowledge_sources：front matter 解析 + 预览脱敏检查 + draft/published/deleted + 版本更新 + 删除撤销 + unsafe 反馈联动隔离与重新发布复活）
 
-### Milestone 4：体验与智能增强
+### Milestone 4：体验与智能增强 ✅（2026-08-10）
 
-- [ ] 外部系统跳转入口
-- [ ] 全局文案与空状态收敛
-- [ ] 配置迁移说明
-- [ ] 基于历史数据的第一版异常检测
+- [x] 外部系统跳转入口（external_systems 表 + env 首启种子/DB 为准/保存热生效 + 侧边栏分组新标签页 noopener + http/https 白名单 + 设置页管理）
+- [x] 全局文案与空状态收敛（Incidents/Playbooks/维护窗口/工作流空状态给「一个明确下一步」；接入引导 curl 可复制 + 测试按钮）
+- [x] 配置迁移说明（docs/MIGRATION.md：配置分布一览 + 备份恢复迁移流程 + 换机器检查清单；模型密钥不单独导出）
+- [x] 基于历史数据的第一版异常检测（internal/anomaly：告警数量 24h 逐小时 vs 历史同期均值 ±2σ 基线；只提示不自动动作；样本不足明确标注）
 
 ## 十一、最终产品判断标准
 
