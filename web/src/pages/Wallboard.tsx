@@ -62,6 +62,14 @@ export default function Wallboard({ embedded = false }: { embedded?: boolean }) 
     queryFn: api.infraMetrics,
     refetchInterval: 30_000,
   })
+  // 告警数量异常检测（KEEPON 七：只读提示；数据不足时显示样本不足说明）
+  const { data: anomalies } = useQuery({
+    queryKey: ['anomaly-alerts'],
+    queryFn: () => api.alertAnomalies(24, 7),
+    refetchInterval: 60_000,
+    retry: false,
+  })
+  const anomalyHits = (anomalies?.items ?? []).filter((a) => a.anomaly)
 
   const c = data?.counts
   const trend = data?.trend ?? []
@@ -226,6 +234,33 @@ export default function Wallboard({ embedded = false }: { embedded?: boolean }) 
             </div>
           ))}
         </div>
+      </div>
+
+      {/* 异常检测（只读提示，不自动动作） */}
+      <div style={{ background: cardBg, border: `1px solid ${border}`, borderRadius: 12, padding: 20 }}>
+        <div style={{ fontSize: 16, color: '#9ca3af', marginBottom: 12 }}>
+          告警异常检测（24h vs 历史同期基线 ±2σ · 仅提示）
+        </div>
+        {anomalyHits.length === 0 ? (
+          <div style={{ color: '#6b7280', fontSize: 15 }}>
+            {anomalies ? '当前无异常：各小时告警数均在基线区间内' : '异常检测暂不可用（后端未装配）'}
+          </div>
+        ) : (
+          anomalyHits.slice(0, 5).map((a) => (
+            <div key={a.hour} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '6px 0', fontSize: 15, borderBottom: `1px solid ${border}` }}>
+              <span style={{ width: 8, height: 8, borderRadius: 4, background: '#f87171' }} />
+              <span style={{ color: '#f87171', fontWeight: 600 }}>{a.count} 条</span>
+              <span>（基线 {a.baseline}±{a.sigma}σ，区间 {a.lower}~{a.upper}）</span>
+              <span style={{ color: '#6b7280', fontSize: 13 }}>{new Date(a.hour).toLocaleString('zh-CN', { hour12: false })}</span>
+              <span style={{ color: '#9ca3af', fontSize: 13, marginLeft: 'auto' }}>{a.reason}</span>
+            </div>
+          ))
+        )}
+        {(anomalies?.items ?? []).some((a) => a.reason?.includes('样本不足')) && (
+          <div style={{ color: '#6b7280', fontSize: 13, marginTop: 8 }}>
+            部分小时历史样本不足（&lt;3 天数据），基线待积累
+          </div>
+        )}
       </div>
 
       {/* 最近事件 + 系统状态 */}
