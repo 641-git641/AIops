@@ -3,9 +3,10 @@ import { Button, Spin, Tag, Tooltip, Typography, message } from 'antd'
 import { CheckOutlined, CloseOutlined, LinkOutlined, RobotOutlined, UserOutlined } from '@ant-design/icons'
 import { useNavigate } from 'react-router-dom'
 import { api } from '../../api'
-import type { Citation } from '../../assistant/types'
+import type { ActionRequest, Citation } from '../../assistant/types'
 import type { AssistantMessage } from '../../assistant/types'
 import type { StreamState } from '../../assistant/streamReducer'
+import ActionApprovalCard from './ActionApprovalCard'
 import ToolStepCard from './ToolStepCard'
 
 // Markdown 渲染按需加载（AGENT_CHAT_PLAN §11.3：重组件懒加载；react-markdown 默认不渲染 raw HTML）。
@@ -136,13 +137,40 @@ function StreamCitations({ citations }: { citations: Citation[] }) {
   )
 }
 
-// ChatTimeline 消息流 + 流式增量（临时态）+ 工具步骤卡。
+// ActionCards 动作请求卡（历史已处理 + 流式新增合并；按 id 去重）。
+function ActionCards({
+  history,
+  streamActions,
+  onChanged,
+}: {
+  history: ActionRequest[]
+  streamActions: ActionRequest[]
+  onChanged: () => void
+}) {
+  const merged = new Map<string, ActionRequest>()
+  for (const a of history) merged.set(a.id, a)
+  for (const a of streamActions) merged.set(a.id, a) // 流式状态优先（最新事件覆盖）
+  if (merged.size === 0) return null
+  return (
+    <div style={{ marginBottom: 12 }}>
+      {[...merged.values()].map((a) => (
+        <ActionApprovalCard key={a.id} action={a} onChanged={onChanged} />
+      ))}
+    </div>
+  )
+}
+
+// ChatTimeline 消息流 + 流式增量（临时态）+ 工具步骤卡 + 动作确认卡。
 export default function ChatTimeline({
   messages,
   stream,
+  actions = [],
+  onActionsChanged,
 }: {
   messages: AssistantMessage[]
   stream: StreamState
+  actions?: ActionRequest[] // 线程历史动作请求（页面刷新恢复）
+  onActionsChanged?: () => void
 }) {
   const streaming = stream.status === 'running'
   return (
@@ -163,6 +191,11 @@ export default function ChatTimeline({
           ))}
         </div>
       )}
+      <ActionCards
+        history={actions}
+        streamActions={stream.actions}
+        onChanged={onActionsChanged ?? (() => {})}
+      />
       {streaming && <StreamCitations citations={stream.citations} />}
       {streaming && (
         <div style={{ display: 'flex', gap: 10, alignItems: 'flex-start' }}>

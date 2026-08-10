@@ -39,13 +39,26 @@ export default function Assistant() {
     setStableMessages(messagesData?.items ?? [])
   }, [messagesData])
 
+  // 线程动作请求（页面刷新/切会话恢复确认卡；决策后失效重拉）
+  const { data: actionsData } = useQuery({
+    queryKey: ['assistant-thread-actions', activeThread],
+    queryFn: () => (activeThread ? api.assistantThreadActions(activeThread) : Promise.resolve({ items: [] })),
+    enabled: !!activeThread,
+  })
+  const invalidateActions = useCallback(() => {
+    if (activeThread) {
+      void qc.invalidateQueries({ queryKey: ['assistant-thread-actions', activeThread] })
+    }
+  }, [activeThread, qc])
+
   // 流式（当前 run）
   const { state: stream } = useRunStream({
     runId: activeRun?.id,
     onTerminal: () => {
-      // 终态后刷新稳定消息（assistant 回复落库）
+      // 终态后刷新稳定消息（assistant 回复落库）与动作请求
       if (activeThread) {
         void qc.invalidateQueries({ queryKey: ['assistant-thread', activeThread] })
+        void qc.invalidateQueries({ queryKey: ['assistant-thread-actions', activeThread] })
       }
       setActiveRun(undefined)
     },
@@ -162,7 +175,12 @@ export default function Assistant() {
           )}
           {activeRun && <RunStatus run={activeRun} />}
         </div>
-        <ChatTimeline messages={stableMessages} stream={stream} />
+        <ChatTimeline
+          messages={stableMessages}
+          stream={stream}
+          actions={actionsData?.items ?? []}
+          onActionsChanged={invalidateActions}
+        />
         <Composer
           sending={!!activeRun || send.isPending}
           onSend={onSend}

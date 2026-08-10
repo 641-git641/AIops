@@ -118,11 +118,22 @@ type AssistantStep struct {
 // TableName 表名。
 func (AssistantStep) TableName() string { return "assistant_steps" }
 
-// 动作请求状态（Phase 3 启用；本期仅建 schema）。
+// 动作请求状态（Phase 3 状态机：pending → confirmed|rejected → executing → succeeded|failed；过期 = expired）。
 const (
-	ActionPending   = "pending"
-	ActionConfirmed = "confirmed"
-	ActionRejected  = "rejected"
+	ActionPending   = "pending"   // 模型提出，等待人工确认
+	ActionConfirmed = "confirmed" // 已确认，开始执行（短暂中间态）
+	ActionRejected  = "rejected"  // 人工拒绝
+	ActionExecuting = "executing" // 执行中
+	ActionSucceeded = "succeeded" // 执行成功
+	ActionFailed    = "failed"    // 执行失败（error 存 DecisionReason）
+	ActionExpired   = "expired"   // 超时未确认
+)
+
+// 动作风险等级（对齐 ChangeAgent 分级语义：low/medium/high）。
+const (
+	RiskLow    = "low"
+	RiskMedium = "medium"
+	RiskHigh   = "high"
 )
 
 // AssistantActionRequest 需人工确认的动作请求（模型只能提出，不能直接执行）。
@@ -133,7 +144,7 @@ type AssistantActionRequest struct {
 	ToolName       string         `gorm:"size:64" json:"toolName"`
 	Arguments      datatypes.JSON `json:"arguments"` // 规范化后的参数
 	RiskLevel      string         `gorm:"size:16" json:"riskLevel"` // low | medium | high
-	Status         string         `gorm:"size:16" json:"status"`    // pending | confirmed | rejected | ...
+	Status         string         `gorm:"size:16;index:idx_asst_action_status" json:"status"`
 	RequestedBy    string         `gorm:"size:64" json:"requestedBy"`
 	DecidedBy      string         `gorm:"size:64" json:"decidedBy,omitempty"`
 	DecisionReason string         `gorm:"size:512" json:"decisionReason,omitempty"`
@@ -169,6 +180,8 @@ const (
 	EvToolCompleted  = "tool.completed"
 	EvToolFailed     = "tool.failed"
 	EvCitationAdded  = "citation.added" // 工具命中证据（data: {citation}）
+	EvActionRequired = "action.required" // 模型提出动作，等待人工确认（data: {actionRequest}）
+	EvActionResolved = "action.resolved" // 动作已确认/拒绝/失败（data: {actionRequest}）
 	EvUsageUpdated   = "usage.updated"
 	EvHeartbeat      = "heartbeat"
 	EvRunStatus      = "run.status" // SSE 重连快照头事件

@@ -470,6 +470,26 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ rating, note: note ?? '' }),
     }),
+  // ---- 异常检测（KEEPON 七：告警数量季节性基线，只读提示） ----
+  alertAnomalies: (hours = 24, historyDays = 7) =>
+    req<{ items: AlertAnomaly[] }>(`/anomaly/alerts?hours=${hours}&historyDays=${historyDays}`),
+
+  // ---- 外部可观测系统（KEEPON 6.2） ----
+  externalSystems: () => req<{ items: ExternalSystem[] }>('/external-systems'),
+  createExternalSystem: (input: Partial<ExternalSystem>) =>
+    req<ExternalSystem>('/external-systems', { method: 'POST', body: JSON.stringify(input) }),
+  updateExternalSystem: (id: string, input: Partial<ExternalSystem>) =>
+    req<ExternalSystem>(`/external-systems/${id}`, { method: 'PUT', body: JSON.stringify(input) }),
+  deleteExternalSystem: (id: string) =>
+    req<unknown>(`/external-systems/${id}`, { method: 'DELETE' }),
+
+  assistantThreadActions: (threadId: string) =>
+    req<{ items: AssistantActionRequest[] }>(`/assistant/threads/${threadId}/actions`),
+  assistantActionDecision: (actionId: string, decision: 'confirm' | 'reject', reason?: string) =>
+    req<AssistantActionRequest>(`/assistant/actions/${actionId}/${decision}`, {
+      method: 'POST',
+      body: JSON.stringify({ reason: reason ?? '' }),
+    }),
   assistantSendMessage: (threadId: string, content: string, idemKey: string) =>
     req<SendMessageResult>(`/assistant/threads/${threadId}/messages`, {
       method: 'POST',
@@ -766,4 +786,46 @@ export interface SendMessageResult {
 export interface RunDetailResponse {
   run: AssistantRunDTO
   steps: unknown[]
+}
+
+// AlertAnomaly 告警数量异常检测项（KEEPON 七）。
+export interface AlertAnomaly {
+  hour: string
+  count: number
+  baseline: number
+  lower: number
+  upper: number
+  sigma: number
+  anomaly: boolean
+  reason?: string
+}
+
+// ExternalSystem 外部可观测系统（KEEPON 6.2）。
+export interface ExternalSystem {
+  id: string
+  tenantId: string
+  name: string
+  url: string
+  type: 'grafana' | 'prometheus' | 'logs' | 'other'
+  enabled: boolean
+  sortOrder: number
+  createdAt: string
+  updatedAt: string
+}
+
+// AssistantActionRequest 人工确认动作请求（Phase 3）。
+export interface AssistantActionRequest {
+  id: string
+  tenantId: string
+  runId: string
+  toolName: string
+  arguments: unknown
+  riskLevel: 'low' | 'medium' | 'high'
+  status: 'pending' | 'executing' | 'succeeded' | 'failed' | 'rejected' | 'expired'
+  requestedBy?: string
+  decidedBy?: string
+  decisionReason?: string
+  expiresAt?: string
+  createdAt: string
+  updatedAt: string
 }

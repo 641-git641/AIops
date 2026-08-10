@@ -188,6 +188,80 @@ func (s *Server) handleMessageFeedback(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
+// handleListThreadActions 线程动作请求列表（页面恢复确认卡）。
+func (s *Server) handleListThreadActions(c *gin.Context) {
+	if !s.assistantGate(c) {
+		return
+	}
+	items, err := s.assist.ListThreadActions(c.Request.Context(), tenantID(c), c.Param("id"), 50)
+	if err != nil {
+		serverErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items})
+}
+
+// actionDecisionInput 确认/拒绝请求体（reason 可选）。
+type actionDecisionInput struct {
+	Reason string `json:"reason"`
+}
+
+// handleConfirmAction 确认动作请求并执行（幂等：重复确认返回已处理错误）。
+func (s *Server) handleConfirmAction(c *gin.Context) {
+	if !s.assistantGate(c) {
+		return
+	}
+	var in actionDecisionInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求体非法: " + err.Error()})
+		return
+	}
+	req, err := s.assist.ConfirmAction(c.Request.Context(), tenantID(c), c.Param("id"), "local-noauth", in.Reason)
+	if errors.Is(err, assistant.ErrNotFound) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "动作请求不存在"})
+		return
+	}
+	if errors.Is(err, assistant.ErrActionExpired) || errors.Is(err, assistant.ErrActionNotPending) {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+	if errors.Is(err, assistant.ErrActionExecutorMissing) {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		serverErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, req) // 执行失败也返回请求（status=failed + 原因），前端展示
+}
+
+// handleRejectAction 拒绝动作请求（不执行）。
+func (s *Server) handleRejectAction(c *gin.Context) {
+	if !s.assistantGate(c) {
+		return
+	}
+	var in actionDecisionInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求体非法: " + err.Error()})
+		return
+	}
+	req, err := s.assist.RejectAction(c.Request.Context(), tenantID(c), c.Param("id"), "local-noauth", in.Reason)
+	if errors.Is(err, assistant.ErrNotFound) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "动作请求不存在"})
+		return
+	}
+	if errors.Is(err, assistant.ErrActionExpired) || errors.Is(err, assistant.ErrActionNotPending) {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		serverErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, req)
+}
+
 // handleCancelRun 取消 run。
 func (s *Server) handleCancelRun(c *gin.Context) {
 	if !s.assistantGate(c) {

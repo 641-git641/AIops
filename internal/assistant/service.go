@@ -12,6 +12,7 @@ import (
 	"aiops/internal/metrics"
 	"aiops/internal/util"
 
+	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
 
@@ -27,7 +28,8 @@ type Service struct {
 	audit     *eventbus.AuditService
 	runner    *Runner // 仅用于指标（ActiveRuns）；run 执行在 runner worker
 	incidents *incident.Service // 绑定对象校验（Phase 2：incident 上下文）
-	m         *metrics.Registry // 反馈指标（可 nil）
+	executor  *ActionExecutor   // 动作执行器（Phase 3；nil = 确认报错「未装配」）
+	m         *metrics.Registry // 反馈/动作指标（可 nil）
 }
 
 // NewService 创建会话服务（incidents 用于绑定上下文校验，可 nil——不校验绑定对象存在性）。
@@ -37,6 +39,9 @@ func NewService(db *gorm.DB, model string, broker *Broker, audit *eventbus.Audit
 
 // SetMetrics 注入指标注册表（可 nil——测试/未装配路径判空）。
 func (s *Service) SetMetrics(m *metrics.Registry) { s.m = m }
+
+// SetExecutor 装配动作执行器（Phase 3；nil = 确认动作报错）。
+func (s *Service) SetExecutor(e *ActionExecutor) { s.executor = e }
 
 // CreateThreadInput 新建会话输入（contextType/contextId 可选：绑定 incident 上下文，Phase 2）。
 type CreateThreadInput struct {
@@ -265,6 +270,144 @@ func (s *Service) ActiveRuns() float64 {
 
 // ErrBadFeedback 反馈参数非法。
 var ErrBadFeedback = errors.New("assistant: rating 必须为 useful 或 not_useful")
+
+// ErrActionNotPending 动作请求已被处理（重复确认/拒绝）。
+var ErrActionNotPending = errors.New("assistant: 动作请求已被处理")
+
+// ErrActionExpired 动作请求已过期。
+var ErrActionExpired = errors.New("assistant: 动作请求已过期")
+
+// ErrActionExecutorMissing 动作执行器未装配。
+var ErrActionExecutorMissing = errors.New("assistant: 动作执行器未装配")
+
+// ListThreadActions 线程动作请求列表（前端恢复确认卡；按创建时间倒序，默认 20）。
+func (s *Service) ListThreadActions(ctx context.Context, tenantID, threadID string, limit int) ([]AssistantActionRequest, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 20
+	}
+	return ListThreadActions(ctx, s.db, tenantID, threadID, limit)
+}
+
+// ConfirmAction 确认动作请求并执行（AGENT_CHAT_PLAN §9.2 六重校验在确认路径重新执行）：
+// 归属 → pending → 未过期 → CAS pending→executing（防双击/并发）→ 执行器 → succeeded/failed。
+// 执行失败不报错返回（请求置 failed，前端展示失败原因）；只有「未确认/重复/过期」返回错误。
+func (s *Service) ConfirmAction(ctx context.Context, tenantID, id, actor, reason string) (*AssistantActionRequest, error) {
+	req, err := GetActionRequest(ctx, s.db, tenantID, id)
+	if err != nil {
+		return nil, err
+	}
+	if req == nil {
+		return nil, ErrNotFound
+	}
+	if req.Status != ActionPending {
+		return nil, fmt.Errorf("%w: 动作请求状态 %s", ErrActionNotPending, req.Status)
+	}
+	if req.ExpiresAt != nil && time.Now().After(*req.ExpiresAt) {
+		req.Status = ActionExpired
+		_ = UpdateActionRequest(ctx, s.db, req)
+		return nil, ErrActionExpired
+	}
+	if s.executor == nil {
+		return nil, ErrActionExecutorMissing
+	}
+	// CAS：仅 pending 可流转（重复确认/并发确认只有一个成功）
+	res := s.db.WithContext(ctx).Model(&AssistantActionRequest{}).
+		Where("id = ? AND tenant_id = ? AND status = ?", id, tenantID, ActionPending).
+		Updates(map[string]any{
+			"status": ActionExecuting, "decided_by": actor,
+			"decision_reason": truncateStr(reason, 500), "updated_at": time.Now().UTC(),
+		})
+	if res.Error != nil {
+		return nil, res.Error
+	}
+	if res.RowsAffected == 0 {
+		return nil, ErrActionNotPending
+	}
+	req.Status, req.DecidedBy, req.DecisionReason = ActionExecuting, actor, truncateStr(reason, 500)
+
+	// 执行（领域副作用；失败 → failed 状态保留原因，前端可见）
+	if err := s.executor.Execute(ctx, tenantID, req, actor, reason); err != nil {
+		req.Status, req.DecisionReason = ActionFailed, truncateStr(err.Error(), 500)
+		_ = UpdateActionRequest(ctx, s.db, req)
+		s.publishActionResolved(ctx, req)
+		s.incActionMetric(req, "confirm", "failed")
+		s.auditAction(ctx, req, "assistant.action.failed", actor, err.Error())
+		return req, nil
+	}
+	req.Status = ActionSucceeded
+	_ = UpdateActionRequest(ctx, s.db, req)
+	s.publishActionResolved(ctx, req)
+	s.incActionMetric(req, "confirm", "succeeded")
+	s.auditAction(ctx, req, "assistant.action.executed", actor, reason)
+	return req, nil
+}
+
+// RejectAction 拒绝动作请求（不执行任何副作用；pending → rejected）。
+func (s *Service) RejectAction(ctx context.Context, tenantID, id, actor, reason string) (*AssistantActionRequest, error) {
+	req, err := GetActionRequest(ctx, s.db, tenantID, id)
+	if err != nil {
+		return nil, err
+	}
+	if req == nil {
+		return nil, ErrNotFound
+	}
+	if req.Status != ActionPending {
+		return nil, fmt.Errorf("%w: 动作请求状态 %s", ErrActionNotPending, req.Status)
+	}
+	if req.ExpiresAt != nil && time.Now().After(*req.ExpiresAt) {
+		req.Status = ActionExpired
+		_ = UpdateActionRequest(ctx, s.db, req)
+		return nil, ErrActionExpired
+	}
+	res := s.db.WithContext(ctx).Model(&AssistantActionRequest{}).
+		Where("id = ? AND tenant_id = ? AND status = ?", id, tenantID, ActionPending).
+		Updates(map[string]any{
+			"status": ActionRejected, "decided_by": actor,
+			"decision_reason": truncateStr(reason, 500), "updated_at": time.Now().UTC(),
+		})
+	if res.Error != nil {
+		return nil, res.Error
+	}
+	if res.RowsAffected == 0 {
+		return nil, ErrActionNotPending
+	}
+	req.Status, req.DecidedBy, req.DecisionReason = ActionRejected, actor, truncateStr(reason, 500)
+	s.publishActionResolved(ctx, req)
+	s.incActionMetric(req, "reject", "rejected")
+	s.auditAction(ctx, req, "assistant.action.rejected", actor, reason)
+	return req, nil
+}
+
+// publishActionResolved 发布 action.resolved 事件（SSE 前端实时更新确认卡状态）。
+func (s *Service) publishActionResolved(ctx context.Context, req *AssistantActionRequest) {
+	if s.broker != nil {
+		_, _ = s.broker.Publish(ctx, req.RunID, req.TenantID, EvActionResolved, map[string]any{
+			"actionRequest": req,
+		})
+	}
+}
+
+// incActionMetric 动作请求指标（tool, decision=proposed|confirm|reject, outcome=状态）。
+func (s *Service) incActionMetric(req *AssistantActionRequest, decision, outcome string) {
+	if s.m != nil {
+		s.m.Inc(metricActionRequestsTotal, req.ToolName, decision, outcome)
+	}
+}
+
+// auditAction 动作审计（回溯：用户 → run → tool call → 目标对象）。
+func (s *Service) auditAction(ctx context.Context, req *AssistantActionRequest, action, actor, reason string) {
+	if s.audit == nil {
+		return
+	}
+	_, _ = s.audit.Record(ctx, eventbus.AuditLog{
+		TenantID: req.TenantID, CorrelationID: req.RunID, Actor: actor,
+		Action: action, Target: req.ID, Reason: truncateStr(reason, 500),
+		Metadata: datatypes.JSON(sprintJSON(map[string]any{
+			"tool": req.ToolName, "args": string(req.Arguments),
+			"riskLevel": req.RiskLevel, "status": req.Status,
+		})),
+	})
+}
 
 // AddFeedback 对最终 assistant 消息提交反馈（rating 白名单；落库 + 审计 + 指标）。
 // 仅允许对 assistant 角色的 complete 消息反馈（工具轮空内容消息跳过）。

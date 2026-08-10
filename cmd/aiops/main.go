@@ -20,6 +20,7 @@ import (
 	"aiops/internal/agent"
 	"aiops/internal/ai"
 	"aiops/internal/alert"
+	"aiops/internal/anomaly"
 	"aiops/internal/api"
 	"aiops/internal/assistant"
 	"aiops/internal/auth"
@@ -28,6 +29,7 @@ import (
 	"aiops/internal/circuit"
 	"aiops/internal/config"
 	"aiops/internal/embedding"
+	"aiops/internal/external"
 	"aiops/internal/eventbus"
 	"aiops/internal/evidence"
 	"aiops/internal/incident"
@@ -563,6 +565,10 @@ func main() {
 		assistant.RegisterMetrics(reg, func() float64 { return float64(asstRunner.ActiveRuns()) })
 		assistSvc = assistant.NewService(db, asstCfg.Model, assistBroker, auditSvc, asstRunner, svc)
 		assistSvc.SetMetrics(reg)
+		// Phase 3：动作执行器（确认路径复用领域 Service 与 Orchestrator 审批语义）
+		assistSvc.SetExecutor(&assistant.ActionExecutor{
+			Alerts: repo, Incidents: svc, Orchestrator: orch,
+		})
 		go asstRunner.RunWorker(consumeCtx)
 		slog.Info("assistant enabled", "model", asstCfg.Model, "source", asstCfg.Source)
 	} else {
@@ -574,6 +580,21 @@ func main() {
 		pbSvc, auditSvc, orch, ntf, ntfCfg, mwSvc, aiSvc, wfSvc, ragSvc, mcCfg, tickets, bkSvc,
 		assistSvc, assistBroker)
 	server.SetMetrics(reg)
+
+	// 4.10 外部可观测系统入口（KEEPON 6.2）：env 首启种子，之后 DB 为准（保存后热生效）
+	extSvc := external.NewService(db)
+	if cfg.ExternalSystems != "" {
+		var seeds []external.SeedItem
+		if err := json.Unmarshal([]byte(cfg.ExternalSystems), &seeds); err != nil {
+			slog.Warn("external: AIOPS_EXTERNALSYSTEMS 不是合法 JSON 数组，跳过种子", "err", err)
+		} else if err := extSvc.Seed(context.Background(), "default", seeds); err != nil {
+			slog.Warn("external: seed", "err", err)
+		}
+	}
+	server.SetExternal(extSvc)
+
+	// 4.11 首版异常检测（KEEPON 七，P3）：告警数量季节性基线，只读提示
+	server.SetAnomaly(anomaly.NewService(db))
 	if ovSvc != nil {
 		server.SetOverview(ovSvc)
 	}

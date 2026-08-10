@@ -58,9 +58,17 @@ type Tool struct {
 	Name        string
 	Description string
 	JSONSchema  map[string]any
-	ReadOnly    bool // 本期恒 true（动作工具 Phase 3）
-	Timeout     time.Duration
-	Call        func(ctx context.Context, in ToolCallCtx) (any, error)
+	ReadOnly    bool // true = 直接执行返回结果；false = 动作工具（Phase 3：只提出确认请求，不执行）
+	// Action 动作规范（非 nil = 动作工具）：模型只能提出请求，执行在确认路径（Service 执行器）。
+	Action *ActionSpec
+	Timeout time.Duration
+	Call    func(ctx context.Context, in ToolCallCtx) (any, error) // 只读工具用；动作工具为 nil
+}
+
+// ActionSpec 动作工具规范（§9.2 动作隔离：提出时校验、确认时重验）。
+type ActionSpec struct {
+	RiskLevel string                                            // low | medium | high（确认卡展示）
+	Validate  func(ctx context.Context, in ToolCallCtx) error   // 提出时的存在性/合法性预检
 }
 
 // Registry 工具注册表。
@@ -73,6 +81,7 @@ func NewRegistry(deps ToolDeps) *Registry {
 	r := &Registry{tools: map[string]Tool{}}
 	registerReadTools(r, deps)
 	registerKnowledgeTools(r, deps) // Phase 2：RAG/playbook 依赖缺失的工具不注册
+	registerActionTools(r, deps)    // Phase 3：人工确认动作工具（依赖缺失不注册）
 	return r
 }
 

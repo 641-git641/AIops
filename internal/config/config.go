@@ -116,6 +116,7 @@ type Config struct {
 
 	// 数据备份（KEEPON 4.1：定时 pg_dump + 轮转 + 可选异地镜像加密 + 恢复校验；默认关闭）
 	BackupEnabled        bool   // 备份 worker 开关（默认 false）
+	ExternalSystems      string // 外部系统首启种子（KEEPON 6.2：JSON 数组字符串，仅表空时播种）
 	BackupIntervalHours  int    // 执行间隔小时（默认 24；距上次成功超间隔才补跑）
 	BackupDir            string // 备份目录（默认 ./backups，0700 创建、文件 0600）
 	BackupKeep           int    // 本机保留份数（默认 10；数量限）
@@ -187,6 +188,7 @@ func Load() (*Config, error) {
 	v.SetDefault("queuedriver", "memory")
 	v.SetDefault("eventbusdriver", "memory")
 	v.SetDefault("authtype", "noauth")
+	v.SetDefault("externalsystems", "") // KEEPON 6.2：外部系统首启种子（JSON 数组；之后 DB 为准）
 	v.SetDefault("notifierchannels", "")
 	v.SetDefault("notifierdingtalk", "")
 	v.SetDefault("notifierfeishu", "")
@@ -369,6 +371,7 @@ func Load() (*Config, error) {
 		ModelCfgAdminAPIs:         v.GetBool("modelcfgadminapis"),
 		ModelCfgAdminTenants:      v.GetString("modelcfgadmintenants"),
 		BackupEnabled:             v.GetBool("backupenabled"),
+		ExternalSystems:           v.GetString("externalsystems"),
 		BackupIntervalHours:       v.GetInt("backupintervalhours"),
 		BackupDir:                 v.GetString("backupdir"),
 		BackupKeep:                v.GetInt("backupkeep"),

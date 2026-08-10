@@ -273,6 +273,7 @@ func (r *Runner) callModel(ctx context.Context, run *AssistantRun, req llm.ChatR
 
 // executeTool 校验并执行单个工具调用。返回回喂模型的工具结果文本。
 // citations 收集器：工具命中证据时追加；追加部分发布 citation.added 事件（引用卡实时展示）。
+// 动作工具（tool.Action 非 nil）走 requestAction：只创建 pending 请求，不执行副作用。
 func (r *Runner) executeTool(ctx context.Context, run *AssistantRun, tc llm.ToolCall, ordinal int, citations *[]Citation) (string, error) {
 	tool, ok := r.reg.Get(tc.Function.Name)
 	if !ok {
@@ -291,6 +292,9 @@ func (r *Runner) executeTool(ctx context.Context, run *AssistantRun, tc llm.Tool
 		r.recordToolStep(ctx, run, ordinal, tc, StepPolicy, "rejected", err.Error(), 0, "")
 		r.incTool(tool.Name, "rejected", 0)
 		return `{"error":"` + truncateStr(err.Error(), 200) + `"}`, nil
+	}
+	if tool.Action != nil {
+		return r.requestAction(ctx, run, tc, tool, args, ordinal)
 	}
 
 	_, _ = r.broker.Publish(ctx, run.ID, run.TenantID, EvToolStarted, map[string]any{
@@ -334,6 +338,76 @@ func (r *Runner) executeTool(ctx context.Context, run *AssistantRun, tc llm.Tool
 	r.auditTool(ctx, run, tool.Name, args)
 	return result, nil
 }
+
+// actionRequestTimeout 动作请求有效时长（超时未确认自动过期）。
+const actionRequestTimeout = 15 * time.Minute
+
+// requestAction 动作工具执行路径（Phase 3）：校验预检 → 创建 pending 动作请求（幂等：
+// 同 tool call id 复用既有请求）→ 发布 action.required 事件 → 返回「已提交人工确认」。
+// 绝不在此路径执行任何副作用（§9.2 动作隔离）。
+func (r *Runner) requestAction(ctx context.Context, run *AssistantRun, tc llm.ToolCall,
+	tool Tool, args map[string]any, ordinal int) (string, error) {
+	start := time.Now()
+	in := ToolCallCtx{TenantID: run.TenantID, RunID: run.ID, Args: args}
+
+	// 1. 预检（对象存在性/合法性）
+	if err := tool.Action.Validate(ctx, in); err != nil {
+		if errors.Is(err, errObjectNotFound) {
+			r.recordToolStep(ctx, run, ordinal, tc, StepPolicy, "rejected", "target not found", 0, "")
+			r.incTool(tool.Name, "rejected", 0)
+			return `{"error":"目标对象不存在，无法发起动作请求"}`, nil
+		}
+		r.recordToolStep(ctx, run, ordinal, tc, StepPolicy, "rejected", err.Error(), 0, "")
+		r.incTool(tool.Name, "rejected", 0)
+		return `{"error":"` + truncateStr(err.Error(), 200) + `"}`, nil
+	}
+
+	// 2. 创建 pending 请求（幂等：同 run + 同 tool call id 复用）
+	req := &AssistantActionRequest{
+		ID:             util.NewID(),
+		TenantID:       run.TenantID,
+		RunID:          run.ID,
+		ToolName:       tool.Name,
+		Arguments:      datatypes.JSON(sprintJSON(args)),
+		RiskLevel:      tool.Action.RiskLevel,
+		Status:         ActionPending,
+		RequestedBy:    "local-noauth", // 无真实身份（AGENT_CHAT_PLAN §9.1 后续扩展）
+		IdempotencyKey: "asst:" + run.ID + ":" + tc.ID,
+		ExpiresAt:      timePtr(time.Now().UTC().Add(actionRequestTimeout)),
+		CreatedAt:      time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}
+	if err := CreateActionRequest(ctx, r.db, req); err != nil {
+		return "", err
+	}
+
+	// 3. 事件 + 步骤 + 指标
+	_, _ = r.broker.Publish(ctx, run.ID, run.TenantID, EvActionRequired, map[string]any{
+		"actionRequest": req,
+	})
+	dur := time.Since(start).Seconds()
+	r.recordToolStep(ctx, run, ordinal, tc, StepToolCall, "ok", "", dur,
+		sprintJSON(map[string]any{"status": req.Status, "actionRequestId": req.ID, "riskLevel": req.RiskLevel}))
+	r.incTool(tool.Name, "ok", dur)
+	r.incAction(tool.Name, "proposed", req.Status)
+	r.auditTool(ctx, run, tool.Name, args)
+	return actionRequestResult(req), nil
+}
+
+// actionRequestResult 工具返回（模型可见：告知已提交人工确认，确认前不执行）。
+func actionRequestResult(req *AssistantActionRequest) string {
+	return sprintJSON(map[string]any{
+		"status":          req.Status,
+		"actionRequestId": req.ID,
+		"riskLevel":       req.RiskLevel,
+		"expiresAt":       req.ExpiresAt.Format(time.RFC3339),
+		"message":         "动作已提交人工确认，等待审批；确认前不会执行任何操作",
+		"requestedAction": req.ToolName,
+		"requestedArgs":   string(req.Arguments),
+	})
+}
+
+// timePtr 时间指针（过期时间赋值用）。
+func timePtr(t time.Time) *time.Time { return &t }
 
 // recordToolStep 落库工具步骤（arguments/result 只存裁剪摘要；result 为空时按错误构造）。
 func (r *Runner) recordToolStep(ctx context.Context, run *AssistantRun, ordinal int, tc llm.ToolCall,

@@ -65,6 +65,23 @@ export interface SendMessageResult {
   runId: string
 }
 
+// ActionRequest 人工确认动作请求（Phase 3：模型只能提出，确认/拒绝后执行）。
+export interface ActionRequest {
+  id: string
+  tenantId: string
+  runId: string
+  toolName: string
+  arguments: unknown
+  riskLevel: 'low' | 'medium' | 'high'
+  status: 'pending' | 'executing' | 'succeeded' | 'failed' | 'rejected' | 'expired'
+  requestedBy?: string
+  decidedBy?: string
+  decisionReason?: string
+  expiresAt?: string
+  createdAt: string
+  updatedAt: string
+}
+
 // ---- SSE 事件（与后端 assistant.Event 对齐） ----
 
 export interface SSEEvent {
@@ -81,6 +98,8 @@ export interface SSEEvent {
     | 'tool.completed'
     | 'tool.failed'
     | 'citation.added'
+    | 'action.required'
+    | 'action.resolved'
     | 'usage.updated'
     | 'heartbeat'
   data?: {
@@ -95,6 +114,7 @@ export interface SSEEvent {
     totalTokens?: number
     citation?: Citation
     citations?: Citation[] // message.completed 携带最终引用
+    actionRequest?: ActionRequest // action.required / action.resolved
   }
   timestamp: string
 }

@@ -2,7 +2,7 @@
 // 按 (runId, sequence) 去重（乱序/重复/重连幂等）；message.delta 50-100ms 合并后落 UI；
 // 终止事件收束流式状态。React Query 只管 REST 快照，SSE 增量只进此 reducer。
 
-import type { Citation, SSEEvent } from './types'
+import type { ActionRequest, Citation, SSEEvent } from './types'
 
 export interface StreamState {
   runId: string
@@ -10,6 +10,7 @@ export interface StreamState {
   content: string // 当前 run 的流式文本（最终并入稳定消息）
   tools: ToolStepState[]
   citations: Citation[] // 本轮命中证据（citation.added 增量聚合）
+  actions: ActionRequest[] // 本轮动作请求（action.required 增量聚合；resolved 更新状态）
   error?: string
   lastSequence: number // 已消费的最大 sequence（断线重连带此值）
   totalTokens?: number
@@ -29,7 +30,7 @@ export type StreamAction =
   | { type: 'finish'; status: 'completed' | 'failed' | 'cancelled'; error?: string }
 
 export function initialState(runId: string): StreamState {
-  return { runId, status: 'running', content: '', tools: [], citations: [], lastSequence: 0 }
+  return { runId, status: 'running', content: '', tools: [], citations: [], actions: [], lastSequence: 0 }
 }
 
 export function streamReducer(state: StreamState, action: StreamAction): StreamState {
@@ -71,6 +72,20 @@ export function streamReducer(state: StreamState, action: StreamAction): StreamS
             // 按 (sourceType,sourceId) 去重（同一证据跨工具轮可能重复命中）
             const dup = next.citations.some((x) => x.sourceType === c.sourceType && x.sourceId === c.sourceId)
             if (!dup) next.citations = [...next.citations, c]
+          }
+          break
+        }
+        case 'action.required': {
+          const ar = ev.data?.actionRequest
+          if (ar && !next.actions.some((a) => a.id === ar.id)) {
+            next.actions = [...next.actions, ar]
+          }
+          break
+        }
+        case 'action.resolved': {
+          const ar = ev.data?.actionRequest
+          if (ar) {
+            next.actions = next.actions.map((a) => (a.id === ar.id ? ar : a))
           }
           break
         }

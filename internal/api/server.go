@@ -6,7 +6,9 @@ import (
 
 	"aiops/internal/ai"
 	"aiops/internal/alert"
+	"aiops/internal/anomaly"
 	"aiops/internal/assistant"
+	"aiops/internal/external"
 	"aiops/internal/auth"
 	"aiops/internal/backup"
 	"aiops/internal/config"
@@ -58,6 +60,8 @@ type Server struct {
 	infra    *infra.Service          // 基础设施指标（监控平板数据源；未装配时 404）
 	assist   *assistant.Service // 对话式 Agent（AGENT_CHAT_PLAN；功能关闭时为 nil，端点 404）
 	assistBr *assistant.Broker  // run 事件 broker（SSE 数据源）
+	external  *external.Service  // 外部可观测系统（KEEPON 6.2；SetExternal 装配）
+	anomalySvc *anomaly.Service   // 异常检测（KEEPON 七；SetAnomaly 装配）
 	m        *metrics.Registry       // Prometheus 文本格式指标出口（压测观测）
 }
 
@@ -169,6 +173,15 @@ func (s *Server) Register(g *gin.Engine) {
 	// 基础设施指标（主机/PostgreSQL/docker 容器；监控平板数据源）
 	api.GET("/infra/metrics", s.handleInfraMetrics)
 	// 对话式 Agent（AGENT_CHAT_PLAN §7；功能关闭时全部 404）
+	// 异常检测（KEEPON 七：只读提示）
+	api.GET("/anomaly/alerts", s.handleAlertAnomalies)
+
+	// 外部可观测系统入口（KEEPON 6.2）
+	api.GET("/external-systems", s.handleListExternalSystems)
+	api.POST("/external-systems", s.handleCreateExternalSystem)
+	api.PUT("/external-systems/:id", s.handleUpdateExternalSystem)
+	api.DELETE("/external-systems/:id", s.handleDeleteExternalSystem)
+
 	api.POST("/assistant/threads", s.handleCreateThread)
 	api.GET("/assistant/threads", s.handleListThreads)
 	api.GET("/assistant/threads/:id", s.handleGetThread)
@@ -176,6 +189,9 @@ func (s *Server) Register(g *gin.Engine) {
 	api.DELETE("/assistant/threads/:id", s.handleDeleteThread)
 	api.POST("/assistant/threads/:id/messages", s.handleCreateMessage)
 	api.POST("/assistant/messages/:id/feedback", s.handleMessageFeedback)
+	api.GET("/assistant/threads/:id/actions", s.handleListThreadActions)
+	api.POST("/assistant/actions/:id/confirm", s.handleConfirmAction)
+	api.POST("/assistant/actions/:id/reject", s.handleRejectAction)
 	api.GET("/assistant/runs/:id", s.handleGetRun)
 	api.GET("/assistant/runs/:id/events", s.handleRunEvents) // SSE（?lastSequence=N 续传）
 	api.POST("/assistant/runs/:id/cancel", s.handleCancelRun)

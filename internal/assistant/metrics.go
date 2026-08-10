@@ -16,6 +16,7 @@ const (
 	metricTokensTotal       = "aiops_assistant_tokens_total"
 	metricCitationsTotal    = "aiops_assistant_citations_total"
 	metricFeedbackTotal     = "aiops_assistant_feedback_total"
+	metricActionRequestsTotal = "aiops_assistant_action_requests_total"
 )
 
 // RegisterMetrics 注册 assistant 指标（main.go 调用）。
@@ -32,6 +33,14 @@ func RegisterMetrics(reg *metrics.Registry, active func() float64) {
 	reg.Counter(metricTokensTotal, "模型 token 用量", "direction", "model")
 	reg.Counter(metricCitationsTotal, "回答引用（source_type=incident|playbook|runbook|knowledge）", "source_type")
 	reg.Counter(metricFeedbackTotal, "消息反馈（rating=useful|not_useful）", "rating")
+	reg.Counter(metricActionRequestsTotal, "动作请求结算（decision=proposed|confirm|reject，outcome=状态）", "tool", "decision", "outcome")
+}
+
+// incAction 动作提出侧指标（runner 调用；确认侧在 service）。
+func (r *Runner) incAction(tool, decision, outcome string) {
+	if r.m != nil {
+		r.m.Inc(metricActionRequestsTotal, tool, decision, outcome)
+	}
 }
 
 func (r *Runner) incRuns(status string) {

@@ -225,6 +225,56 @@ func GetMessage(ctx context.Context, db *gorm.DB, tenantID, msgID string) (*Assi
 	return &m, nil
 }
 
+// ---------- Action Request（Phase 3） ----------
+
+// CreateActionRequest 创建动作请求（pending；idempotency 冲突返回既有请求，不报错）。
+func CreateActionRequest(ctx context.Context, db *gorm.DB, req *AssistantActionRequest) error {
+	var existing AssistantActionRequest
+	err := db.WithContext(ctx).Where("tenant_id = ? AND idempotency_key = ?", req.TenantID, req.IdempotencyKey).
+		First(&existing).Error
+	if err == nil {
+		*req = existing
+		return nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+	return db.WithContext(ctx).Create(req).Error
+}
+
+// GetActionRequest 查单条动作请求。
+func GetActionRequest(ctx context.Context, db *gorm.DB, tenantID, id string) (*AssistantActionRequest, error) {
+	var req AssistantActionRequest
+	err := db.WithContext(ctx).Where("tenant_id = ? AND id = ?", tenantID, id).First(&req).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &req, nil
+}
+
+// ListThreadActions 列出线程的动作请求（页面恢复卡片用；按创建时间倒序）。
+func ListThreadActions(ctx context.Context, db *gorm.DB, tenantID, threadID string, limit int) ([]AssistantActionRequest, error) {
+	var items []AssistantActionRequest
+	err := db.WithContext(ctx).
+		Where("tenant_id = ? AND run_id IN (SELECT id FROM assistant_runs WHERE tenant_id = ? AND thread_id = ?)",
+			tenantID, tenantID, threadID).
+		Order("created_at DESC").
+		Limit(limit).Find(&items).Error
+	return items, err
+}
+
+// UpdateActionRequest 更新动作请求（status/decided_by/decision_reason/updated_at）。
+func UpdateActionRequest(ctx context.Context, db *gorm.DB, req *AssistantActionRequest) error {
+	req.UpdatedAt = time.Now().UTC()
+	return db.WithContext(ctx).Model(req).Updates(map[string]any{
+		"status": req.Status, "decided_by": req.DecidedBy,
+		"decision_reason": req.DecisionReason, "updated_at": req.UpdatedAt,
+	}).Error
+}
+
 // ---------- Feedback ----------
 
 // CreateFeedback 落一条消息反馈（消息归属校验由 Service 层完成）。

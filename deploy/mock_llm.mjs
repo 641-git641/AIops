@@ -108,8 +108,14 @@ function firstToolCalls(user, scenario) {
       { id: 'call-m2', type: 'function', function: { name: 'get_platform_overview', arguments: '{}' } },
     ]
   }
-  // 注意顺序：更具体的关键词（相似/知识/剧本）必须排在宽泛词（事故/告警）之前，
+  // 注意顺序：更具体的关键词（相似/知识/剧本/动作）必须排在宽泛词（事故/告警）之前，
   // 否则「相似历史事故」会被「事故」分支拦截。
+  if (user.includes('确认') || user.includes('审批') || user.includes('执行动作')) {
+    return [{ id: 'call-act1', type: 'function', function: { name: 'approve_incident_action', arguments: '{"incident_id":"inc-1001","decision":"approve"}' } }]
+  }
+  if (user.includes('认领') || user.includes('ack')) {
+    return [{ id: 'call-act2', type: 'function', function: { name: 'ack_alert', arguments: '{"alert_id":"alert-1"}' } }]
+  }
   if (user.includes('相似')) {
     return [{ id: 'call-s1', type: 'function', function: { name: 'get_similar_incidents', arguments: '{"incident_id":"inc-1001","limit":5}' } }]
   }
@@ -167,6 +173,10 @@ function finalAnswer(lastToolName) {
       return '检索到 1 条相似历史事故「pay 数据库连接池耗尽（上月）」（T3）：现象为 pay 接口超时 ECONNREFUSED，处置为扩容 db 副本并回滚 v1.2.3，验证后 P99 恢复。与当前事故（inc-1001）症状吻合。'
     case 'list_playbooks':
       return '可用剧本 2 个：rollback（L1，爆炸半径 0.35，强制 dry-run）与 scale_up（L1，爆炸半径 0.2，强制 dry-run）。均为低风险动作，须 dry-run 先行。'
+    case 'approve_incident_action':
+      return '已提交动作确认请求（approve inc-1001 的 L1 自愈动作「扩容 db 副本」，高风险，15 分钟内有效）。请在界面确认后才会真正执行。'
+    case 'ack_alert':
+      return '已提交告警确认请求（acknowledge alert-1，低风险）。请在界面确认后才会真正执行。'
     case 'query_metrics':
       return 'pay 服务 CPU 指标近 30 分钟从 0.5 上升至 1.6（趋势 up），存在明显资源增长，需结合日志确认是否异常。'
     case 'search_logs':

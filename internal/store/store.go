@@ -10,6 +10,7 @@ import (
 
 	"aiops/internal/alert"
 	"aiops/internal/assistant"
+	"aiops/internal/external"
 	"aiops/internal/auth"
 	"aiops/internal/backup"
 	"aiops/internal/eventbus"
@@ -166,6 +167,7 @@ func migrate(db *gorm.DB, alertPartitions bool) error {
 		&assistant.AssistantActionRequest{},
 		&assistant.AssistantEvent{},
 		&assistant.AssistantFeedback{}, // 消息反馈（AGENT_CHAT_PLAN Phase 2）
+		&external.System{},             // 外部可观测系统入口（KEEPON 6.2）
 	}
 	if err := db.AutoMigrate(models...); err != nil {
 		return err
