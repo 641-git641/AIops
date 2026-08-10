@@ -1,9 +1,11 @@
 # AIOps 中间件编排：PostgreSQL（唯一存储，app 本地 run 连接）。
 # 规范约定：mysql/redis 等中间件一律用 docker 启动；应用本体开发期 `go run`。
 # 生产部署可参照 app 服务注释启用容器化。
+# 镜像 pgvector/pgvector:pg16 = PG16 + vector 扩展（RAG 知识检索层；与 postgres:16 同大版本，
+# aiops_pgdata 卷数据格式兼容，直接换镜像即可，升级前建议先备份卷）。
 services:
   postgres:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:pg16
     container_name: aiops-postgres
     environment:
       POSTGRES_USER: aiops
@@ -37,6 +39,12 @@ services:
   #     postgres:
   #       condition: service_healthy
   #   restart: unless-stopped
+  #   # 容器日志轮转（防 stdout 日志打满磁盘；应用层 AIOPS_LOGFILE 文件轮转与此互不冲突）
+  #   logging:
+  #     driver: json-file
+  #     options:
+  #       max-size: "50m"
+  #       max-file: "5"
 
 volumes:
   aiops_pgdata:

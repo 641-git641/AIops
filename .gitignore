@@ -29,3 +29,11 @@ web/dist/
 
 # loadgen 回归基准留痕（Phase 3f）
 /.bench/
+
+# 数据备份与日志（KEEPON M1：备份含模型 apiKey，绝不入库）
+/backups/
+/backups-mirror/
+/logs/
+
+# 个人文档（不进 git）
+/简历提示 Prompt.md
