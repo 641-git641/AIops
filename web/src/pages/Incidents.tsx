@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
-import { Table, Tag, Typography, Space, Badge } from 'antd'
+import { Empty, Table, Tag, Typography, Space, Badge } from 'antd'
 import { Link } from 'react-router-dom'
 import { api, type Incident } from '../api'
 
@@ -60,6 +60,19 @@ export default function Incidents() {
         loading={isFetching}
         dataSource={data?.items}
         columns={columns}
+        locale={{
+          emptyText: (
+            <Empty
+              description={
+                <span>
+                  还没有事故。发送一条测试告警即可触发关联：
+                  <Typography.Text code>{`curl -X POST http://localhost:8080/api/v1/webhook/generic -H 'Content-Type: application/json' -d '{"title":"测试告警","severity":"critical"}'`}</Typography.Text>
+                  （总览页有可复制的接入引导）
+                </span>
+              }
+            />
+          ),
+        }}
         pagination={{ total: data?.total, defaultPageSize: 20, showTotal: (t) => `共 ${t} 条` }}
       />
     </Space>

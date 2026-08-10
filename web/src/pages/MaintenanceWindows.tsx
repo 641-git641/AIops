@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
-  Table, Tag, Button, Space, Card, Modal, Form, Input, Select, Switch, Popconfirm, DatePicker,
+  Table, Tag, Button, Space, Card, Modal, Form, Input, Select, Switch, Popconfirm, DatePicker, Empty,
 } from 'antd'
 import { PlusOutlined } from '@ant-design/icons'
 import type { Dayjs } from 'dayjs'
@@ -102,6 +102,7 @@ export default function MaintenanceWindows() {
           loading={isLoading}
           dataSource={data?.items ?? []}
           pagination={false}
+          locale={{ emptyText: <Empty description="还没有维护窗口。创建窗口后，匹配的告警在窗口期内以 suppressed 状态入库，不触发事故与通知" /> }}
           columns={[
             {
               title: '名称', dataIndex: 'name',

@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
-  Table, Tag, Button, Space, Card, Modal, Form, Input, InputNumber, Select, Switch, Popconfirm,
+  Table, Tag, Button, Space, Card, Modal, Form, Input, InputNumber, Select, Switch, Popconfirm, Empty,
 } from 'antd'
 import { PlusOutlined } from '@ant-design/icons'
 import { api, type Playbook } from '../api'
@@ -78,6 +78,7 @@ export default function Playbooks() {
           loading={isLoading}
           dataSource={data?.items ?? []}
           pagination={false}
+          locale={{ emptyText: <Empty description="还没有剧本。RCA 建议动作按剧本名匹配，可在上方创建（如 rollback / scale_up），缺省时自愈动作需人工确认" /> }}
           columns={[
             {
               title: '名称', dataIndex: 'name',
